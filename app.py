@@ -10,12 +10,27 @@ base = desk.load_config()
 
 # Alpaca paper keys (optional, only for the option panel) come from Streamlit secrets
 import os
-try:
-    for k in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
-        if k in st.secrets:
-            os.environ[k] = str(st.secrets[k])
-except Exception:
-    pass
+def _load_keys():
+    """Find the Alpaca key and secret in Streamlit secrets, whatever names or section they were saved under."""
+    try:
+        flat = {}
+        for k, v in dict(st.secrets).items():
+            if hasattr(v, "items"):
+                flat.update({str(k2): str(v2) for k2, v2 in v.items()})
+            else:
+                flat[str(k)] = str(v)
+    except Exception:
+        return "no secrets saved"
+    vals = [v.strip() for v in flat.values() if v and v.strip()]
+    key = next((v for v in vals if v.startswith("PK") and len(v) <= 30), "")
+    sec = next((v for v in vals if v != key and len(v) >= 36 and " " not in v), "")
+    if key and sec:
+        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"] = key, sec
+        return "ok"
+    return f"{len(vals)} value(s) saved, but " + ("no key starting with PK" if not key else "no secret") + " found"
+
+
+KEY_STATE = _load_keys()
 
 with st.sidebar:
     st.header("Settings")
@@ -28,6 +43,9 @@ with st.sidebar:
     replay_date = st.date_input("Session date", dt.datetime.now(desk.NY).date()) if replay else None
     replay_time = st.time_input("As of (New York time)", dt.time(16, 0)) if replay else None
     st.caption("Yahoo data is delayed. This page shows a plan and never places an order.")
+    if KEY_STATE != "ok":
+        st.warning(f"Option ideas are off: {KEY_STATE}. Add your Alpaca paper key and secret under "
+                   "Manage app > Settings > Secrets.")
 
 # ---- watchlist editor: add / remove tickers for this browser session; the page link remembers the changes
 import re
