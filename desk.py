@@ -309,6 +309,8 @@ def _alpaca_chain(ticker, lo, hi, d0, d1):
     """Alpaca option-chain snapshots. Keys come from the environment, never from the repo."""
     key = (os.environ.get("ALPACA_API_KEY") or "").strip()
     sec = (os.environ.get("ALPACA_SECRET_KEY") or "").strip()
+    if sec.startswith("PK") and not key.startswith("PK"):       # the two values were saved under each other's name
+        key, sec = sec, key
     if not key or not sec:
         return None
     snaps, token = {}, None
