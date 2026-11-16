@@ -12,6 +12,11 @@
   "level_target_r": 2,
   "retest_tolerance_pct": 0.1,
   "trade_shorts": false,
+  "option_days": 5,
+  "option_otm_min": 2,
+  "option_otm_max": 5,
+  "option_stop_pct": 15,
+  "option_expiries_shown": 2,
   "watchlist": [
     "PFE",
     "D",
@@ -80,6 +85,7 @@
     "FDX",
     "MSFT",
     "HD",
-    "MA"
+    "MA",
+    "IWM"
   ]
 }

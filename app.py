@@ -8,6 +8,15 @@ import desk
 st.set_page_config(page_title="ORB Desk", layout="wide")
 base = desk.load_config()
 
+# Alpaca paper keys (optional, only for the option panel) come from Streamlit secrets
+import os
+try:
+    for k in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+        if k in st.secrets:
+            os.environ[k] = str(st.secrets[k])
+except Exception:
+    pass
+
 with st.sidebar:
     st.header("Settings")
     ticker = st.text_input("Ticker (AUTO = first watchlist breakout)", base["ticker"]).strip().upper() or "AUTO"

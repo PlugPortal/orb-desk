@@ -9,6 +9,7 @@ import html
 import json
 import math
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -300,6 +301,97 @@ def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
     return out
 
 
+# ---------------------------------------------------------------- options (needs Alpaca keys)
+OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
+
+def _alpaca_chain(ticker, lo, hi, d0, d1):
+    """Alpaca option-chain snapshots. Keys come from the environment, never from the repo."""
+    key, sec = os.environ.get("ALPACA_API_KEY"), os.environ.get("ALPACA_SECRET_KEY")
+    if not key or not sec:
+        return None
+    snaps, token = {}, None
+    for _ in range(4):
+        q = {"feed": "indicative", "limit": 1000, "strike_price_gte": f"{lo:.2f}", "strike_price_lte": f"{hi:.2f}",
+             "expiration_date_gte": d0.isoformat(), "expiration_date_lte": d1.isoformat()}
+        if token:
+            q["page_token"] = token
+        url = ("https://data.alpaca.markets/v1beta1/options/snapshots/"
+               + urllib.parse.quote(ticker.replace("-", ".")) + "?" + urllib.parse.urlencode(q))
+        req = urllib.request.Request(url, headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec,
+                                                   "accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+        snaps.update(body.get("snapshots") or {})
+        token = body.get("next_page_token")
+        if not token:
+            break
+    return snaps
+
+
+def option_ideas(ticker, spot, cfg, today, chain=None):
+    """Out-of-the-money calls and puts for the next few sessions, sized to the budget.
+
+    Stop is a percent of the premium paid (ask); targets are 1x, 2x, 3x that risk.
+    """
+    days, d1 = cfg.get("option_days", 5), today
+    n = 1
+    while n < days:                                              # count trading days, today included
+        d1 += dt.timedelta(days=1)
+        if d1.weekday() < 5:
+            n += 1
+    try:
+        snaps = chain if chain is not None else _alpaca_chain(ticker, spot * 0.85, spot * 1.15, today, d1)
+    except urllib.error.HTTPError as err:
+        return {"status": f"ERROR {err.code}", "calls": [], "puts": []}
+    except Exception as err:
+        return {"status": f"ERROR {type(err).__name__}", "calls": [], "puts": []}
+    if snaps is None:
+        return {"status": "NO KEYS", "calls": [], "puts": []}
+    sp = cfg.get("option_stop_pct", 15) / 100
+    lo_n, hi_n = cfg.get("option_otm_min", 2), cfg.get("option_otm_max", 5)
+    max_loss = cfg["budget"] * cfg["max_loss_pct"] / 100
+    book = {}
+    for sym, s in snaps.items():
+        m = OCC.match(sym)
+        if not m:
+            continue
+        exp = dt.datetime.strptime(m.group(2), "%y%m%d").date()
+        if not (today <= exp <= d1):
+            continue
+        qt = s.get("latestQuote") or {}
+        book.setdefault((m.group(3), exp), []).append((int(m.group(4)) / 1000, qt.get("bp") or 0, qt.get("ap") or 0, sym))
+    out = {"status": "OK", "calls": [], "puts": []}
+    for kind, name in (("C", "calls"), ("P", "puts")):
+        exps = sorted(e for k, e in book if k == kind)[: cfg.get("option_expiries_shown", 2)]
+        for exp in exps:
+            ladder = sorted((x for x in book[(kind, exp)] if (x[0] > spot if kind == "C" else x[0] < spot)),
+                            key=lambda x: x[0], reverse=(kind == "P"))
+            for i, (strike, bid, ask, sym) in enumerate(ladder, start=1):
+                if not (lo_n <= i <= hi_n):
+                    continue
+                row = {"symbol": sym, "expiry": exp, "dte": (exp - today).days, "strike": strike, "otm": i,
+                       "bid": bid, "ask": ask}
+                if ask <= 0:
+                    row.update(verdict="BLOCK", reason="no quote", qty=0)
+                else:
+                    qty = math.floor(cfg["budget"] / (ask * 100))
+                    row.update(cost=ask * 100, stop=ask * (1 - sp), t1=ask * (1 + sp), t2=ask * (1 + 2 * sp),
+                               t3=ask * (1 + 3 * sp), qty=qty, loss_at_stop=qty * ask * 100 * sp)
+                    if qty < 1:
+                        row.update(verdict="BLOCK", reason="over budget")
+                    elif ask * sp < 0.01:
+                        row.update(verdict="BLOCK", reason="stop under 1 cent")
+                    elif bid <= ask * (1 - sp):
+                        row.update(verdict="BLOCK", reason="spread wider than stop")
+                    elif row["loss_at_stop"] > max_loss + 0.005:
+                        row.update(verdict="BLOCK", reason="over max loss")
+                    else:
+                        row.update(verdict="PASS", reason="")
+                out[name].append(row)
+    return out
+
+
 def analyze_ticker(ticker, cfg, now, session_date=None):
     try:
         meta, bars = fetch_bars(ticker)
@@ -342,11 +434,19 @@ def build_state(cfg, now=None, session_date=None):
             (s for s in scans if s["ticker"] == cfg.get("fallback_ticker")), scans[0])
     else:
         focus = next((s for s in scans if s["ticker"] == want), None) or analyze_ticker(want, cfg, now, session_date)
+    live = session_date is None
     return {
         "cfg": cfg, "now": now, "scans": scans, "triggered": triggered, "focus": focus,
         "news": fetch_news(focus["ticker"]),
-        "live": session_date is None,
+        "live": live,
+        "options": _focus_options(focus, cfg, now, live),
     }
+
+
+def _focus_options(focus, cfg, now, live):
+    if not live or "last" not in focus:
+        return {"status": "REPLAY", "calls": [], "puts": []}
+    return option_ideas(focus["ticker"], focus["last"], cfg, now.date())
 
 
 # ---------------------------------------------------------------- page
@@ -451,7 +551,8 @@ STATUS_COL = {"TRIGGERED": "gr", "WAITING": "am", "BUILDING RANGE": "am", "NO TR
 def with_focus(state, ticker):
     """Same scan, different ticker in focus (used to build one static page per watchlist name)."""
     focus = next(s for s in state["scans"] if s["ticker"] == ticker)
-    return dict(state, focus=focus, news=fetch_news(ticker))
+    return dict(state, focus=focus, news=fetch_news(ticker),
+                options=_focus_options(focus, state["cfg"], state["now"], state["live"]))
 
 
 def render(state, nav=False, auto_page=False):
@@ -575,6 +676,47 @@ def render(state, nav=False, auto_page=False):
         '<div class="b dim">PDH/PDL = prior day high/low · PMH/PML = premarket high/low (4:00-9:30 ET). '
         + ('Shorts are marked WATCH ONLY: shown for reference and hedging, not as trades to take.' if not cfg.get("trade_shorts", False) else '')
         + '</div></div>')
+    op = state.get("options") or {"status": "REPLAY", "calls": [], "puts": []}
+    long_live = [n for n, ok in [("ORB", trig)] if ok] + [l["name"] for l in a.get("levels", [])
+                                                           if l["status"] == "TRIGGERED" and l["side"] == "LONG"]
+    short_live = [l["name"] for l in a.get("levels", []) if l["status"] == "TRIGGERED" and l["side"] == "SHORT"]
+    osp = cfg.get("option_stop_pct", 15)
+
+    def opt_rows(rows, live_names, label):
+        hdr = (f'<tr><td colspan="12" class="am">{label} · '
+               + (f'<span class="gr">live trigger: {", ".join(live_names)}</span>' if live_names
+                  else '<span class="dim">no live trigger</span>') + '</td></tr>')
+        body = []
+        for r in rows:
+            base = (f'<td>{r["expiry"]:%b %d} ({r["dte"]}d)</td><td class="r">{r["strike"]:g}</td>'
+                    f'<td class="r dim">{r["otm"]} OTM</td><td class="r">{r["bid"]:.2f}</td><td class="r">{r["ask"]:.2f}</td>')
+            if "cost" in r:
+                base += (f'<td class="r">{_money(r["cost"])}</td><td class="r rd">{r["stop"]:.2f}</td>'
+                         f'<td class="r gr">{r["t1"]:.2f}</td><td class="r gr">{r["t2"]:.2f}</td><td class="r gr">{r["t3"]:.2f}</td>'
+                         f'<td class="r">{r["qty"]}</td>')
+            else:
+                base += '<td colspan="6"></td>'
+            vc = "gr" if r["verdict"] == "PASS" else "rd"
+            body.append(f'<tr>{base}<td class="{vc}">{r["verdict"]}{" · " + r["reason"] if r["reason"] else ""}</td></tr>')
+        return hdr + ("".join(body) or '<tr><td colspan="12" class="dim">no contracts in range</td></tr>')
+
+    if op["status"] == "OK":
+        obody = ('<div style="overflow-x:auto"><table><tr><th>EXPIRY</th><th class="r">STRIKE</th><th></th><th class="r">BID</th>'
+                 f'<th class="r">ASK</th><th class="r">COST x1</th><th class="r">STOP -{osp}%</th><th class="r">1:1</th>'
+                 '<th class="r">1:2</th><th class="r">1:3</th><th class="r">QTY</th><th>RISK</th></tr>'
+                 + opt_rows(op["calls"], long_live, "CALLS for long setups")
+                 + opt_rows(op["puts"], short_live, "PUTS for short setups") + '</table></div>'
+                 '<div class="b dim">Indicative quotes from Alpaca: delayed and adjusted, not tradable prices. '
+                 'Cost assumes buying at the ask. Untested idea: no historical option data was available to test this rule.</div>')
+    else:
+        why = {"NO KEYS": "Add your Alpaca paper keys as secrets to switch this panel on (see README).",
+               "REPLAY": "Option quotes are shown for the live session only."}.get(
+                   op["status"], f'Alpaca returned {e(op["status"])}. Check the keys and try again.')
+        obody = f'<div class="b dim">{why}</div>'
+    options_panel = (
+        '<div class="p" style="margin-top:12px"><h2>OPTION IDEAS<span>'
+        f'{cfg.get("option_otm_min", 2)}-{cfg.get("option_otm_max", 5)} strikes OTM · expiring within '
+        f'{cfg.get("option_days", 5)} sessions incl. 0DTE · stop {osp}% of premium</span></h2>{obody}</div>')
     n_lv = sum(1 for s in scans for l in s.get("levels", []) if l["status"] == "TRIGGERED")
 
     head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
@@ -596,6 +738,7 @@ def render(state, nav=False, auto_page=False):
  </div>
 </div>
 {levels_panel}
+{options_panel}
 <div class="grid">
  <div class="p"><h2>PIPELINE<span>each step feeds the next</span></h2>
   <table><tr><th>STEP</th><th>STATUS</th><th>DETAIL</th></tr>{pipe}</table></div>

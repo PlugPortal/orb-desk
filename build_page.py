@@ -32,6 +32,7 @@ def main():
     for t, page in pages:
         with open(os.path.join(out, f"{t}.html"), "w", encoding="utf-8") as f:
             f.write(page)
+    print("options panel:", state["options"]["status"])
     a = state["focus"]
     print(f'{a["ticker"]}: {a["status"]} | triggered on watchlist: {len(state["triggered"])}/{len(state["scans"])}')
 
