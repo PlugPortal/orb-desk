@@ -1,0 +1,16 @@
+{
+  "ticker": "AUTO",
+  "fallback_ticker": "TSLA",
+  "budget": 500,
+  "max_loss_pct": 15,
+  "target_r_multiple": 2,
+  "min_reward_risk": 1,
+  "range_minutes": 15,
+  "entry_cutoff": "11:30",
+  "flat_by": "15:55",
+  "watchlist": [
+    "TSLA", "NVDA", "AMD", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "NFLX", "PLTR",
+    "SOFI", "F", "INTC", "BAC", "UBER", "COIN", "HOOD", "MARA", "RIVN", "NIO",
+    "SNAP", "PYPL", "DIS", "T", "PFE"
+  ]
+}
