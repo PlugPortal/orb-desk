@@ -53,21 +53,24 @@ def parse_chart(raw):
     res = json.loads(raw)["chart"]["result"][0]
     meta = res.get("meta", {})
     q = res["indicators"]["quote"][0]
-    bars = []
+    bars, pre = [], []
     for i, ts in enumerate(res.get("timestamp") or []):
         o, h, l, c, v = (q[k][i] for k in ("open", "high", "low", "close", "volume"))
         if None in (o, h, l, c):
             continue
         t = dt.datetime.fromtimestamp(ts, NY)
-        if not (dt.time(9, 30) <= t.time() < dt.time(16, 0)):
-            continue
-        bars.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v or 0})
+        bar = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v or 0}
+        if dt.time(4, 0) <= t.time() < dt.time(9, 30):
+            pre.append(bar)                                      # premarket, used for PMH / PML
+        elif dt.time(9, 30) <= t.time() < dt.time(16, 0):
+            bars.append(bar)
+    meta["pre_bars"] = pre
     return meta, bars
 
 
 def fetch_bars(ticker):
     url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
-           + urllib.parse.quote(ticker) + "?interval=5m&range=5d")
+           + urllib.parse.quote(ticker) + "?interval=5m&range=5d&includePrePost=true")
     return parse_chart(_get(url))
 
 
@@ -199,6 +202,104 @@ def analyze(day_bars, prev_close, cfg, now):
     return out
 
 
+def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
+    """Second setup: retest of the prior-day high/low and premarket high/low.
+
+    Long above PDH / PMH, short below PDL / PML. A level must first be broken by a 5-minute
+    close, then touched again and closed back on the breakout side: that close is the entry.
+    Stop is a fixed percent of the entry price; target is a multiple of that risk.
+    """
+    if not day_bars:
+        return []
+    day = day_bars[0]["t"].date()
+    done = [b for b in day_bars if b["t"] + BAR <= now]
+    cutoff = dt.datetime.combine(day, _hhmm(cfg["entry_cutoff"]), NY)
+    flat_t = dt.datetime.combine(day, _hhmm(cfg["flat_by"]), NY)
+    sp = cfg.get("level_stop_pct", 1) / 100
+    rm = cfg.get("level_target_r", 2)
+    tol = cfg.get("retest_tolerance_pct", 0.1) / 100
+    max_loss = round(cfg["budget"] * cfg["max_loss_pct"] / 100, 2)
+    pre = [b for b in pre_bars if b["t"].date() == day and b["t"] + BAR <= now]
+    defs = {}
+    if prior_bars:
+        defs["PDH"] = ("LONG", max(b["h"] for b in prior_bars))
+        defs["PDL"] = ("SHORT", min(b["l"] for b in prior_bars))
+    if len(pre) >= 3:
+        defs["PMH"] = ("LONG", max(b["h"] for b in pre))
+        defs["PML"] = ("SHORT", min(b["l"] for b in pre))
+    out = []
+    for name in ("PDH", "PMH", "PDL", "PML"):
+        if name not in defs:
+            out.append({"name": name, "status": "N/A"})
+            continue
+        side, level = defs[name]
+        sg = 1 if side == "LONG" else -1
+        r = {"name": name, "side": side, "level": level, "status": "NOT OPEN"}
+        out.append(r)
+        if not done:
+            continue
+        r["dist_pct"] = (level / done[-1]["c"] - 1) * 100
+        prev, bi = done[0]["o"], None
+        for i, b in enumerate(done):
+            if b["t"] + BAR > cutoff:
+                break
+            if sg * (prev - level) <= 0 and sg * (b["c"] - level) > 0:
+                bi = i
+                break
+            prev = b["c"]
+        if bi is None:
+            r["status"] = "NO BREAK" if now >= cutoff else "WAITING"
+            continue
+        r["break_time"] = done[bi]["t"] + BAR
+        ei, failed = None, False
+        for j in range(bi + 1, len(done)):
+            b = done[j]
+            if b["t"] + BAR > cutoff:
+                break
+            touch = b["l"] <= level * (1 + tol) if sg > 0 else b["h"] >= level * (1 - tol)
+            if touch:
+                if sg * (b["c"] - level) > 0:
+                    ei = j
+                else:
+                    failed = True
+                break
+        if failed:
+            r["status"] = "FAILED RETEST"
+            continue
+        if ei is None:
+            r["status"] = "NO RETEST" if now >= cutoff else "BROKE, AWAITING RETEST"
+            continue
+        entry = round(done[ei]["c"], 2)
+        risk = round(entry * sp, 2)
+        stop = round(entry - sg * risk, 2)
+        target = round(entry + sg * rm * risk, 2)
+        by_loss = math.floor(max_loss / risk) if risk > 0 else 0
+        by_budget = math.floor(cfg["budget"] / entry)
+        shares = max(0, min(by_loss, by_budget))
+        ok = shares >= 1 and round(shares * risk, 2) <= max_loss and shares * entry <= cfg["budget"]
+        if side == "SHORT" and not cfg.get("trade_shorts", False):
+            verdict = "WATCH ONLY"
+        else:
+            verdict = "PASS" if ok else "BLOCK"
+        result, exit_px, exit_time = "OPEN", done[-1]["c"], done[-1]["t"] + BAR
+        for b in done[ei + 1:]:
+            if (sg > 0 and b["l"] <= stop) or (sg < 0 and b["h"] >= stop):   # both in one bar: stop first
+                result, exit_px, exit_time = "STOPPED", stop, b["t"] + BAR
+                break
+            if (sg > 0 and b["h"] >= target) or (sg < 0 and b["l"] <= target):
+                result, exit_px, exit_time = "TARGET", target, b["t"] + BAR
+                break
+            if b["t"] + BAR >= flat_t:
+                result, exit_px, exit_time = "FLAT AT CLOSE", round(b["c"], 2), b["t"] + BAR
+                break
+        r.update(status="TRIGGERED", trigger_time=done[ei]["t"] + BAR, entry=entry, stop=stop,
+                 target=target, risk=risk, shares=shares, cost=round(shares * entry, 2),
+                 loss_at_stop=round(shares * risk, 2), verdict=verdict, result=result,
+                 exit_px=exit_px, exit_time=exit_time,
+                 pnl=round(shares * sg * (exit_px - entry), 2) + 0.0)
+    return out
+
+
 def analyze_ticker(ticker, cfg, now, session_date=None):
     try:
         meta, bars = fetch_bars(ticker)
@@ -221,6 +322,7 @@ def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
     if meta.get("previousClose") and day == max(days):
         prev_close = meta["previousClose"]
     a = analyze(days[day], prev_close, cfg, now)
+    a["levels"] = analyze_levels(days[day], days[prior] if prior else [], meta.get("pre_bars", []), cfg, now)
     a["ticker"] = ticker
     a["name"] = meta.get("shortName") or ticker
     return a
@@ -287,6 +389,10 @@ def _chart(a):
         if k in a:
             ys.append(a[k])
     lo, hi = min(ys), max(ys)
+    span = hi - lo
+    lv_draw = [l for l in a.get("levels", []) if "level" in l and lo - span * 0.5 <= l["level"] <= hi + span * 0.5]
+    for l in lv_draw:
+        lo, hi = min(lo, l["level"]), max(hi, l["level"])
     pad = (hi - lo) * 0.06 or 1
     lo, hi = lo - pad, hi + pad
     n = 78                                                       # 5-minute bars in a full session
@@ -311,6 +417,11 @@ def _chart(a):
             s.append(f'<line x1="{L}" x2="{W-R}" y1="{y(a[k]):.1f}" y2="{y(a[k]):.1f}" stroke="#f5a623" '
                      f'stroke-dasharray="6 5" opacity=".8"/>'
                      f'<text x="{L+4}" y="{y(a[k])-5:.1f}" fill="#f5a623" font-size="11">{lab} {a[k]:.2f}</text>')
+    for l in lv_draw:
+        s.append(f'<line x1="{L}" x2="{W-R}" y1="{y(l["level"]):.1f}" y2="{y(l["level"]):.1f}" stroke="#6fb7ff" '
+                 f'stroke-dasharray="2 4" opacity=".9"/>'
+                 f'<text x="{W-R-4}" y="{y(l["level"])-4:.1f}" fill="#6fb7ff" font-size="11" text-anchor="end">'
+                 f'{l["name"]} {l["level"]:.2f}</text>')
     if a.get("status") == "TRIGGERED":
         x1 = xi(a["trigger_time"])
         s.append(f'<rect x="{x1:.1f}" y="{y(a["target"]):.1f}" width="{W-R-x1:.1f}" '
@@ -375,6 +486,9 @@ def render(state, nav=False, auto_page=False):
             det = f'{s["gap_to_high_pct"]:+.2f}% to range high {s["range_high"]:.2f}'
         else:
             det = s.get("error", "")[:40]
+        lt = [l["name"] for l in s.get("levels", []) if l["status"] == "TRIGGERED"]
+        if lt:
+            det += " · retest: " + ", ".join(lt)
         c = s.get("chg_pct")
         rows.append(f'<tr><td>{e(s["ticker"])}</td><td class="{STATUS_COL.get(s["status"], "")}">{s["status"]}</td>'
                     f'<td>{e(det)}</td><td class="r">{"" if c is None else f"{c:+.2f}%"}</td></tr>')
@@ -434,6 +548,35 @@ def render(state, nav=False, auto_page=False):
         verdict = '<div class="verdict dim">NO TRADE</div>'
         send = ""
 
+    LCOL = {"TRIGGERED": "gr", "WAITING": "am", "BROKE, AWAITING RETEST": "am", "FAILED RETEST": "rd"}
+    lrows = []
+    for l in a.get("levels", []):
+        if "level" not in l:
+            lrows.append(f'<tr><td>{l["name"]}</td><td class="dim" colspan="9">no data for this level</td></tr>')
+            continue
+        if l["status"] == "TRIGGERED":
+            vc = {"PASS": "gr", "BLOCK": "rd"}.get(l["verdict"], "am")
+            rc = "gr" if l["pnl"] > 0 else ("rd" if l["pnl"] < 0 else "am")
+            tail = (f'<td class="r">{l["entry"]:.2f} at {l["trigger_time"]:%H:%M}</td><td class="r rd">{l["stop"]:.2f}</td>'
+                    f'<td class="r gr">{l["target"]:.2f}</td><td class="r">{l["shares"]}</td>'
+                    f'<td class="r">{_money(l["loss_at_stop"])}</td><td class="{vc}">{l["verdict"]}</td>'
+                    f'<td class="{rc}">{l["result"]} {l["exit_px"]:.2f} · {_money(l["pnl"])}</td>')
+        else:
+            tail = f'<td class="dim" colspan="7">{l["dist_pct"]:+.2f}% from last price</td>' if "dist_pct" in l \
+                else '<td class="dim" colspan="7"></td>'
+        lrows.append(f'<tr><td>{l["name"]}</td><td class="{"gr" if l["side"] == "LONG" else "rd"}">{l["side"]}</td>'
+                     f'<td class="r">{l["level"]:.2f}</td><td class="{LCOL.get(l["status"], "dim")}">{l["status"]}</td>{tail}</tr>')
+    levels_panel = (
+        '<div class="p" style="margin-top:12px"><h2>LEVELS · SECOND SETUP<span>retest of prior-day and premarket '
+        f'high/low · stop {cfg.get("level_stop_pct", 1)}% · target {cfg.get("level_target_r", 2)}R</span></h2>'
+        '<div style="overflow-x:auto"><table><tr><th>LEVEL</th><th>SIDE</th><th class="r">PRICE</th><th>STATUS</th>'
+        '<th class="r">ENTRY</th><th class="r">STOP</th><th class="r">TARGET</th><th class="r">SHARES</th>'
+        '<th class="r">LOSS AT STOP</th><th>RISK</th><th>RESULT</th></tr>' + "".join(lrows) + '</table></div>'
+        '<div class="b dim">PDH/PDL = prior day high/low · PMH/PML = premarket high/low (4:00-9:30 ET). '
+        + ('Shorts are marked WATCH ONLY: shown for reference and hedging, not as trades to take.' if not cfg.get("trade_shorts", False) else '')
+        + '</div></div>')
+    n_lv = sum(1 for s in scans for l in s.get("levels", []) if l["status"] == "TRIGGERED")
+
     head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
             f'<span>{last_txt} {chg_txt}</span>')
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -447,10 +590,12 @@ def render(state, nav=False, auto_page=False):
  <div>
   <div class="p"><h2>SCANNER<span>watchlist of {len(scans)}</span></h2><div class="b">
    <div class="tiles"><div class="tile"><div class="lab">CHARTS SCANNED</div><div class="big">{len(scans)}</div></div>
-   <div class="tile"><div class="lab">CLOSED ABOVE {cfg["range_minutes"]}M RANGE</div><div class="big gr">{n_trig}</div></div></div>
+   <div class="tile"><div class="lab">CLOSED ABOVE {cfg["range_minutes"]}M RANGE</div><div class="big gr">{n_trig}</div></div>
+   <div class="tile"><div class="lab">LEVEL RETEST ENTRIES</div><div class="big" style="color:#6fb7ff">{n_lv}</div></div></div>
    <table>{"".join(rows)}</table></div></div>
  </div>
 </div>
+{levels_panel}
 <div class="grid">
  <div class="p"><h2>PIPELINE<span>each step feeds the next</span></h2>
   <table><tr><th>STEP</th><th>STATUS</th><th>DETAIL</th></tr>{pipe}</table></div>

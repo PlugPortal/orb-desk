@@ -14,6 +14,12 @@ The page shows a plan. It never places an order.
 3. Stop = range midpoint. Target = entry + 2 x (entry - stop). Flat by 15:55.
 4. Shares = the smaller of (max loss / risk per share) and (budget / entry price).
 
+## Second setup: level retests
+Levels: PDH/PDL (prior day high/low) and PMH/PML (premarket high/low, 4:00-9:30 New York).
+Long above PDH/PMH, short below PDL/PML. A 5-minute close must break the level, then a later bar must
+touch it again and close back on the breakout side; that close is the entry (before 11:30).
+Stop = 1% of entry, target = 2R. Shorts are shown as WATCH ONLY unless `trade_shorts` is true.
+
 ## Settings (`config.json`)
 `budget` 500, `max_loss_pct` 15, `target_r_multiple` 2, `entry_cutoff`, `flat_by`, `watchlist`,
 and `ticker` ("AUTO" picks the first watchlist breakout that passes the risk check, or name one ticker).

@@ -8,6 +8,10 @@
   "range_minutes": 15,
   "entry_cutoff": "11:30",
   "flat_by": "15:55",
+  "level_stop_pct": 1,
+  "level_target_r": 2,
+  "retest_tolerance_pct": 0.1,
+  "trade_shorts": false,
   "watchlist": [
     "PFE",
     "D",
