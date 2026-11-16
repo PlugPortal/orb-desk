@@ -307,7 +307,8 @@ OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 def _alpaca_chain(ticker, lo, hi, d0, d1):
     """Alpaca option-chain snapshots. Keys come from the environment, never from the repo."""
-    key, sec = os.environ.get("ALPACA_API_KEY"), os.environ.get("ALPACA_SECRET_KEY")
+    key = (os.environ.get("ALPACA_API_KEY") or "").strip()
+    sec = (os.environ.get("ALPACA_SECRET_KEY") or "").strip()
     if not key or not sec:
         return None
     snaps, token = {}, None

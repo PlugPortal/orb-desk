@@ -33,6 +33,9 @@ def main():
         with open(os.path.join(out, f"{t}.html"), "w", encoding="utf-8") as f:
             f.write(page)
     print("options panel:", state["options"]["status"])
+    k, s = (os.environ.get("ALPACA_API_KEY") or ""), (os.environ.get("ALPACA_SECRET_KEY") or "")
+    print(f"key check: key length {len(k.strip())}, starts with PK: {k.strip().startswith('PK')}, "
+          f"secret length {len(s.strip())}, stray spaces: {k != k.strip() or s != s.strip()}")
     a = state["focus"]
     print(f'{a["ticker"]}: {a["status"]} | triggered on watchlist: {len(state["triggered"])}/{len(state["scans"])}')
 
