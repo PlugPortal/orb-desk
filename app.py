@@ -5,7 +5,7 @@ import streamlit as st
 
 import desk
 
-st.set_page_config(page_title="ORB Desk", layout="wide")
+st.set_page_config(page_title="ORB Desk", layout="wide", initial_sidebar_state="expanded")
 base = desk.load_config()
 
 # Alpaca paper keys (optional, only for the option panel) come from Streamlit secrets
