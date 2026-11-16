@@ -23,7 +23,15 @@ def main():
     out = os.path.join(desk.HERE, "site")
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "index.html"), "w", encoding="utf-8") as f:
-        f.write(desk.render(state))
+        f.write(desk.render(state, nav=True, auto_page=True))
+    # one page per watchlist ticker, so the ticker can be switched from the page itself
+    from concurrent.futures import ThreadPoolExecutor
+    tickers = [s["ticker"] for s in state["scans"]]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        pages = list(ex.map(lambda t: (t, desk.render(desk.with_focus(state, t), nav=True)), tickers))
+    for t, page in pages:
+        with open(os.path.join(out, f"{t}.html"), "w", encoding="utf-8") as f:
+            f.write(page)
     a = state["focus"]
     print(f'{a["ticker"]}: {a["status"]} | triggered on watchlist: {len(state["triggered"])}/{len(state["scans"])}')
 

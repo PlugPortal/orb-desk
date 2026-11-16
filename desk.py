@@ -266,6 +266,9 @@ text-align:left;white-space:nowrap}th{color:#f5a623;font-weight:600}td.r,th.r{te
 .news td{white-space:normal}.foot{margin-top:12px;font-size:12px}
 .note{border:1px dashed #f5a623;padding:8px 10px;margin-top:10px;text-align:center}
 svg{display:block;width:100%;height:auto}
+.nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}
+.nav a{border:1px solid #3a2f16;padding:3px 9px}.nav a:hover{border-color:#f5a623;text-decoration:none}
+.nav a.on{background:#f5a623;color:#0b0906;border-color:#f5a623;font-weight:700}
 @media(max-width:900px){.grid,.grid3{grid-template-columns:1fr}}
 """
 
@@ -334,9 +337,23 @@ STATUS_COL = {"TRIGGERED": "gr", "WAITING": "am", "BUILDING RANGE": "am", "NO TR
               "NOT OPEN": "dim", "NO DATA": "rd"}
 
 
-def render(state):
+def with_focus(state, ticker):
+    """Same scan, different ticker in focus (used to build one static page per watchlist name)."""
+    focus = next(s for s in state["scans"] if s["ticker"] == ticker)
+    return dict(state, focus=focus, news=fetch_news(ticker))
+
+
+def render(state, nav=False, auto_page=False):
     cfg, a, now = state["cfg"], state["focus"], state["now"]
     e = html.escape
+    navbar = ""
+    if nav:
+        links = [f'<a class="{"on" if auto_page else ""}" href="index.html">AUTO</a>']
+        for s in sorted(state["scans"], key=lambda s: s["ticker"]):
+            cls = ("on " if (not auto_page and s["ticker"] == a.get("ticker")) else "") + \
+                  ("gr" if s["status"] == "TRIGGERED" else "")
+            links.append(f'<a class="{cls.strip()}" href="{e(s["ticker"])}.html">{e(s["ticker"])}</a>')
+        navbar = '<div class="nav"><span class="lab">TICKER</span>' + "".join(links) + "</div>"
     trig = a.get("status") == "TRIGGERED"
     scans = state["scans"]
     n_trig = len(state["triggered"])
@@ -424,6 +441,7 @@ def render(state):
 <style>{CSS}</style></head><body>
 <div class="bar"><div><b>{e(a.get("ticker", "-"))}</b> <span class="am">&lt;EQUITY&gt; DESK</span></div>
 <div><span class="gr">PAPER</span> · <span class="am">{mode}</span> · SESSION {session_txt} · AS OF {now:%b %d %H:%M} ET</div></div>
+{navbar}
 <div class="grid">
  <div class="p"><h2>{head}</h2>{_chart(a)}</div>
  <div>
