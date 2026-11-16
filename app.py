@@ -19,7 +19,6 @@ except Exception:
 
 with st.sidebar:
     st.header("Settings")
-    ticker = st.text_input("Ticker (AUTO = first watchlist breakout)", base["ticker"]).strip().upper() or "AUTO"
     budget = st.number_input("Budget ($)", min_value=50.0, value=float(base["budget"]), step=50.0)
     max_loss_pct = st.number_input("Max loss per trade (% of budget)", min_value=0.5, max_value=100.0,
                                    value=float(base["max_loss_pct"]), step=0.5)
@@ -87,6 +86,10 @@ for name, vals in (("add", adds), ("remove", rems)):
 if not watch:
     st.warning("The watchlist is empty. Add a ticker or reset to the saved list.")
     st.stop()
+
+AUTO_LABEL = "AUTO (first breakout that passes the risk check)"
+pick = st.selectbox("Ticker in focus: choose any ticker on your watchlist", [AUTO_LABEL] + sorted(watch), key="focus")
+ticker = "AUTO" if pick == AUTO_LABEL else pick
 
 cfg = dict(base, ticker=ticker, budget=budget, max_loss_pct=max_loss_pct, target_r_multiple=r_mult, watchlist=watch)
 
