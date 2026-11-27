@@ -21,9 +21,31 @@ from zoneinfo import ZoneInfo
 
 import quant as q
 
+e_ = html.escape
+
 NY = ZoneInfo("America/New_York")
 UA = {"User-Agent": "Mozilla/5.0 (orb-desk)"}
-BAR = dt.timedelta(minutes=5)
+BAR = dt.timedelta(minutes=5)                                     # Yahoo's bar; resampled to cfg["bar_minutes"]
+
+
+def bar_minutes(cfg):
+    return int(cfg.get("bar_minutes", 5))
+
+
+def set_bar(cfg):
+    """The desk runs on `bar_minutes` candles (10 by default, the timeframe Ripster trades on). Yahoo has no
+    10-minute interval, so 5-minute bars are fetched and merged two at a time, aligned to the clock (9:30, 9:40, ...)."""
+    global BAR
+    BAR = dt.timedelta(minutes=bar_minutes(cfg))
+
+
+def to_bar_size(meta, bars, cfg):
+    """Resamples the regular, premarket and after-hours bars to `bar_minutes`. No-op at 5."""
+    m = bar_minutes(cfg)
+    if m == 5:
+        return meta, bars
+    meta = dict(meta, pre_bars=q.resample(meta.get("pre_bars", []), m), post_bars=q.resample(meta.get("post_bars", []), m))
+    return meta, q.resample(bars, m)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -216,7 +238,7 @@ def analyze(day_bars, prev_close, cfg, now, history=None, clouds=None):
     cutoff = dt.datetime.combine(day, _hhmm(cfg["entry_cutoff"]), NY)
     flat_t = dt.datetime.combine(day, _hhmm(cfg["flat_by"]), NY)
     rng = [b for b in done if b["t"] < range_end]
-    need = cfg["range_minutes"] // 5
+    need = max(1, cfg["range_minutes"] // bar_minutes(cfg))
     if len(rng) < need:
         out["status"] = "BUILDING RANGE"
         return out
@@ -397,6 +419,109 @@ def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now, clouds=None):
     return out
 
 
+# ---------------------------------------------------------------- confluence arrows
+def confluence_score(bar, vwap_now, ema, rvol, a, cfg):
+    """Five confirmations, scored for a long and for a short on one closed 5-minute bar:
+    1 close vs VWAP, 2 close vs the 10m trend cloud (34/50), 3 fast cloud (5/12) direction and side,
+    4 close beyond the opening range (over the high for a long, under the low for a short),
+    5 relative volume at or over `confluence_rvol` (counts for both sides: volume confirms whichever way it breaks).
+    Returns (long_points, short_points, {name: (long_ok, short_ok)})."""
+    c = bar["c"]
+    fast, trend = cloud_pairs(cfg)
+    rv_ok = rvol is not None and rvol >= cfg.get("confluence_rvol", 1.5)
+    hi, lo = a.get("range_high"), a.get("range_low")
+    parts = {
+        "VWAP": (vwap_now is not None and c > vwap_now, vwap_now is not None and c < vwap_now),
+        f"{trend[0]}/{trend[1]}": (bool(cloud_agrees(ema, trend, c, "LONG", True)),
+                                   bool(cloud_agrees(ema, trend, c, "SHORT", True))),
+        f"{fast[0]}/{fast[1]}": (bool(cloud_agrees(ema, fast, c, "LONG", False)),
+                                 bool(cloud_agrees(ema, fast, c, "SHORT", False))),
+        "Range": (hi is not None and round(c, 2) > round(hi, 2), lo is not None and round(c, 2) < round(lo, 2)),
+        "Volume": (rv_ok, rv_ok),
+    }
+    return sum(l for l, _ in parts.values()), sum(sh for _, sh in parts.values()), parts
+
+
+def _play(done, i, entry, stop, target, side, flat_t):
+    """Walks the bars after index i: first of stop (checked first when both are in one bar), target, or flat time."""
+    sg = 1 if side == "LONG" else -1
+    for b in done[i + 1:]:
+        if (sg > 0 and b["l"] <= stop) or (sg < 0 and b["h"] >= stop):
+            return "STOPPED", stop, b["t"] + BAR
+        if (sg > 0 and b["h"] >= target) or (sg < 0 and b["l"] <= target):
+            return "TARGET", target, b["t"] + BAR
+        if b["t"] + BAR >= flat_t:
+            return "FLAT AT CLOSE", round(b["c"], 2), b["t"] + BAR
+    return "OPEN", round(done[-1]["c"], 2), done[-1]["t"] + BAR
+
+
+def confluence_arrows(a, cfg, now, history=None, clouds=None):
+    """BUY / SELL arrows at the confluence point. A setup must have triggered first (ORB or a level retest; shorts only
+    from PDL / PML retests). From its trigger bar to the entry cutoff, the arrow goes on the first closed bar whose
+    score for that side reaches `confluence_min` (4 of 5 by default) while the setup's stop has not been touched.
+    At most one BUY and one SELL per session: the earliest. Fills a["conf"] (score per bar) and a["arrows"]."""
+    done = a.get("bars") or []
+    a["conf"], a["arrows"] = [], []
+    if not done:
+        return a
+    vw = q.vwap_series(done)
+    slots = {}
+    for day_bars in history or []:
+        for h in day_bars:
+            if h["v"]:
+                slots.setdefault(h["t"].time(), []).append(h["v"])
+    for b, v in zip(done, vw):
+        ema = cloud_at(clouds, b["t"] + BAR)
+        same = slots.get(b["t"].time())
+        rv = b["v"] / (sum(same) / len(same)) if same and b["v"] else None
+        L_, S_, parts = confluence_score(b, v, ema, rv, a, cfg)
+        a["conf"].append({"t": b["t"], "long": L_, "short": S_, "parts": parts})
+    day = done[0]["t"].date()
+    cutoff = dt.datetime.combine(day, _hhmm(cfg["entry_cutoff"]), NY)
+    flat_t = dt.datetime.combine(day, _hhmm(cfg["flat_by"]), NY)
+    need = int(cfg.get("confluence_min", 4))
+    rm = cfg.get("target_r_multiple", 2)
+    setups = []
+    if a.get("status") == "TRIGGERED":
+        setups.append(("ORB", "LONG", a["trigger_time"], a["stop"]))
+    for l in a.get("levels", []):
+        if l.get("status") == "TRIGGERED":
+            setups.append((l["name"], l["side"], l["trigger_time"], l["stop"]))
+    for side in ("LONG", "SHORT"):
+        best = None
+        for name, sd, trig_end, stop in setups:
+            if sd != side:
+                continue
+            sg = 1 if side == "LONG" else -1
+            for i, b in enumerate(done):
+                if b["t"] + BAR < trig_end:
+                    continue
+                if b["t"] + BAR > cutoff:
+                    break
+                if b["t"] + BAR > trig_end and ((sg > 0 and b["l"] <= stop) or (sg < 0 and b["h"] >= stop)):
+                    break                                        # setup stopped out before confluence arrived
+                score = a["conf"][i]["long" if sg > 0 else "short"]
+                if score >= need and sg * (b["c"] - stop) > 0:
+                    if best is None or b["t"] < best[1]["t"]:
+                        best = (i, b, name, stop, score)
+                    break
+        if best is None:
+            continue
+        i, b, name, stop, score = best
+        entry = round(b["c"], 2)
+        risk = round(abs(entry - stop), 2)
+        target = round(entry + (1 if side == "LONG" else -1) * rm * risk, 2)
+        res, px, t_out = _play(done, i, entry, stop, target, side, flat_t)
+        a["arrows"].append({
+            "side": side, "signal": "BUY" if side == "LONG" else "SELL", "setup": name, "t": b["t"],
+            "time": b["t"] + BAR, "entry": entry, "stop": stop, "target": target, "risk": risk, "score": score,
+            "need": need, "parts": a["conf"][i]["parts"], "result": res, "exit_px": px, "exit_time": t_out,
+            "r_result": ((px - entry) if side == "LONG" else (entry - px)) / risk if risk > 0 else None,
+            "watch_only": side == "SHORT" and not cfg.get("trade_shorts", False),
+        })
+    return a
+
+
 # ---------------------------------------------------------------- options (needs Alpaca keys)
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
@@ -526,6 +651,8 @@ def analyze_ticker(ticker, cfg, now, session_date=None):
 
 
 def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
+    set_bar(cfg)
+    meta, bars = to_bar_size(meta, bars, cfg)
     days = split_sessions(bars)
     dates = sorted(d for d in days if d <= now.date())
     if session_date:
@@ -543,6 +670,7 @@ def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
     clouds = build_clouds([b for b in cbars if b["t"].date() <= day], cfg)
     a = analyze(days[day], prev_close, cfg, now, history=[days[d] for d in dates[:-1]], clouds=clouds)
     a["levels"] = analyze_levels(days[day], days[prior] if prior else [], meta.get("pre_bars", []), cfg, now, clouds)
+    confluence_arrows(a, cfg, now, history=[days[d] for d in dates[:-1]], clouds=clouds)
     a["cloud_bars"] = [cloud_at(clouds, b["t"] + BAR) for b in a["bars"]]
     a["cloud_now"] = a["cloud_bars"][-1] if a["cloud_bars"] else None
     a["ticker"] = ticker
@@ -565,7 +693,14 @@ def backtest_sessions(ticker, days, past_dates, pre_bars, cfg, clouds=None):
             rows.append({"setup": "ORB", "ticker": ticker, "t": a["trigger_time"], "r": a["r_result"],
                          "cost_r": a["cost_r"] or 0.0, "result": a["result"],
                          "fast_ok": a.get("fast_ok"), "trend_ok": a.get("trend_ok")})
-        for l in analyze_levels(days[d], prior, pre_bars, cfg, end, clouds):
+        a["levels"] = analyze_levels(days[d], prior, pre_bars, cfg, end, clouds)
+        confluence_arrows(a, cfg, end, history=[days[x] for x in past_dates[:i]], clouds=clouds)
+        for ar in a["arrows"]:
+            if ar["r_result"] is not None:
+                c = q.cost_in_r(ar["risk"], cfg.get("slippage_per_share", 0.01), cfg.get("commission_per_trade", 0.0), 1) or 0.0
+                rows.append({"setup": ar["signal"] + " ARROW", "ticker": ticker, "t": ar["time"], "r": ar["r_result"],
+                             "cost_r": c, "result": ar["result"]})
+        for l in a["levels"]:
             if l.get("status") == "TRIGGERED" and l.get("r_result") is not None:
                 c = q.cost_in_r(l["risk"], cfg.get("slippage_per_share", 0.01),
                                 cfg.get("commission_per_trade", 0.0), l["shares"] or 1) or 0.0
@@ -589,6 +724,8 @@ def backtest_summary(scans, cfg):
         groups.append((f"{setup} + {tn}", [r for r in base if r.get("trend_ok")]))
         groups.append((f"{setup} + {tn} + {fn}", [r for r in base if r.get("trend_ok") and r.get("fast_ok")]))
         groups.append((f"{setup} against {tn}", [r for r in base if r.get("trend_ok") is False]))
+    for setup in ("BUY ARROW", "SELL ARROW"):
+        groups.append((setup, [r for r in rows if r["setup"] == setup]))
     out = []
     for setup, rs in groups:
         net = [r["r"] - r["cost_r"] for r in rs]
@@ -610,7 +747,7 @@ def focus_quant(focus, scans, cfg, now):
     closes_by_day = [[b["c"] for b in bs] for _, bs in sorted(days.items())]
     rets = [r for cl in closes_by_day for r in q.log_returns(cl)]   # within-session 5m returns, no overnight gaps
     sig = q.stdev(rets)
-    out = {"sigma5": sig, "ewma5": q.ewma_vol(rets), "ann_vol": q.annualize_vol(sig, q.BARS_PER_DAY * q.DAYS_PER_YEAR),
+    out = {"sigma5": sig, "ewma5": q.ewma_vol(rets), "ann_vol": q.annualize_vol(sig, 390 // bar_minutes(cfg) * q.DAYS_PER_YEAR),
            "n_rets": len(rets), "vwap": focus.get("vwap")}
     if focus.get("vwap") and focus.get("last"):
         out["vs_vwap_pct"] = (focus["last"] / focus["vwap"] - 1) * 100
@@ -644,6 +781,7 @@ def focus_quant(focus, scans, cfg, now):
 def build_state(cfg, now=None, session_date=None):
     """Everything the page needs. `now` and `session_date` let you replay a past session."""
     now = now or dt.datetime.now(NY)
+    set_bar(cfg)
     watch = list(dict.fromkeys(cfg["watchlist"]))
     with ThreadPoolExecutor(max_workers=5) as ex:
         scans = list(ex.map(lambda t: analyze_ticker(t, cfg, now, session_date), watch))
@@ -679,7 +817,7 @@ font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:14px
 a{color:inherit;text-decoration:none}a:hover{text-decoration:underline}
 .bar{border:1px solid #f5a623;padding:8px 12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .am{color:#f5a623}.gr{color:#2fd27a}.rd{color:#ff4d3d}.dim{color:#8a7a55}
-.grid{display:grid;grid-template-columns:1.45fr 1fr;gap:12px;margin-top:12px}
+.grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:12px;margin-top:12px}
 .grid3{display:grid;grid-template-columns:1.45fr .5fr .5fr;gap:12px;margin-top:12px}
 .p{border:1px solid #f5a623;min-width:0}.p>h2{margin:0;background:#f5a623;color:#0b0906;font-size:14px;
 padding:5px 10px;display:flex;justify-content:space-between;gap:8px}
@@ -731,13 +869,13 @@ def _chart(a):
         lo, hi = min(lo, min(near)), max(hi, max(near))
     pad = (hi - lo) * 0.06 or 1
     lo, hi = lo - pad, hi + pad
-    n = 78                                                       # 5-minute bars in a full session
+    n = 390 // int(BAR.total_seconds() // 60)                    # bars in a full 9:30-16:00 session
     step = (W - L - R) / n
     y = lambda p: T + (hi - p) / (hi - lo) * (H - T - B)
     day = bars[0]["t"].date()
     open_t = dt.datetime.combine(day, dt.time(9, 30), NY)
     xi = lambda t: L + ((t - open_t) / BAR) * step
-    s = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="5-minute chart">']
+    s = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{int(BAR.total_seconds() // 60)}-minute chart">']
     for i in range(5):                                           # price grid
         p = lo + (hi - lo) * i / 4
         s.append(f'<line x1="{L}" x2="{W-R}" y1="{y(p):.1f}" y2="{y(p):.1f}" stroke="#221b0d"/>'
@@ -782,6 +920,27 @@ def _chart(a):
         top, bot = y(max(b["o"], b["c"])), y(min(b["o"], b["c"]))
         s.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{y(b["h"]):.1f}" y2="{y(b["l"]):.1f}" stroke="{col}"/>'
                  f'<rect x="{x-w/2:.1f}" y="{top:.1f}" width="{w:.1f}" height="{max(1.0, bot-top):.1f}" fill="{col}"/>')
+    for ar in a.get("arrows", []):
+        bi = next((i for i, b in enumerate(bars) if b["t"] == ar["t"]), None)
+        if bi is None:
+            continue
+        b = bars[bi]
+        x = xi(b["t"]) + step / 2
+        long_ = ar["side"] == "LONG"
+        col = "#2fd27a" if long_ else "#ff4d3d"
+        if long_:
+            y0 = y(b["l"]) + 6
+            tri = f"{x:.1f},{y0:.1f} {x - 8:.1f},{y0 + 14:.1f} {x + 8:.1f},{y0 + 14:.1f}"
+            ty = y0 + 28
+        else:
+            y0 = y(b["h"]) - 6
+            tri = f"{x:.1f},{y0:.1f} {x - 8:.1f},{y0 - 14:.1f} {x + 8:.1f},{y0 - 14:.1f}"
+            ty = y0 - 20
+        lab = f'{ar["signal"]} {ar["entry"]:.2f} · {ar["score"]}/5'
+        s.append(f'<polygon points="{tri}" fill="{col}" stroke="#0b0906" stroke-width="1"/>'
+                 f'<rect x="{x - 52:.1f}" y="{ty - 11:.1f}" width="104" height="15" rx="3" fill="{col}"/>'
+                 f'<text x="{x:.1f}" y="{ty:.1f}" fill="#0b0906" font-size="11" font-weight="700" '
+                 f'text-anchor="middle">{lab}</text>')
     s.append("</svg>")
     return "".join(s)
 
@@ -830,6 +989,26 @@ def _cloud_svg(a, bars, cb, xi, y, step, lo, hi, L, H):
     for i, (col, txt) in enumerate(labels):
         out.append(f'<text x="{L + 110 + i * 190}" y="{H - 30}" fill="{col}" font-size="11">{txt}</text>')
     return "".join(out)
+
+
+def _conf_strip(a, cfg):
+    """One line over the chart: confluence now (long and short, out of 5), which checks are on, and the arrows."""
+    conf = a.get("conf") or []
+    if not conf:
+        return ""
+    now_ = conf[-1]
+    need = int(cfg.get("confluence_min", 4))
+    tag = lambda n: "gr" if n >= need else ("am" if n == need - 1 else "dim")
+    chips = " ".join(f'<span class="{"gr" if l_ else ("rd" if s_ else "dim")}">{e_(k)}</span>'
+                     for k, (l_, s_) in now_["parts"].items())
+    arrows = " · ".join(
+        f'<span class="{"gr" if ar["side"] == "LONG" else "rd"}">{"▲" if ar["side"] == "LONG" else "▼"} '
+        f'{ar["signal"]} ({e_(ar["setup"])}) {ar["entry"]:.2f} at {ar["time"]:%H:%M}'
+        f'{" · watch only" if ar["watch_only"] else ""}</span>' for ar in a.get("arrows", [])) \
+        or '<span class="dim">no arrow yet</span>'
+    return (f'<div class="b" style="border-bottom:1px solid #2a2212;padding:6px 10px">CONFLUENCE '
+            f'<b class="{tag(now_["long"])}">L {now_["long"]}/5</b> | <b class="{tag(now_["short"])}">S {now_["short"]}/5</b>'
+            f' <span class="dim">(arrow at {need}/5)</span> · {chips} · SIGNAL: {arrows}</div>')
 
 
 def _cloud_txt(ema, price, cfg):
@@ -888,6 +1067,8 @@ def render(state, nav=False, auto_page=False):
             det = f'{s["gap_to_high_pct"]:+.2f}% to range high {s["range_high"]:.2f}'
         else:
             det = s.get("error", "")[:40]
+        for ar in s.get("arrows", []):
+            det += f' {"▲" if ar["side"] == "LONG" else "▼"}{ar["time"]:%H:%M}'
         lt = [l["name"] for l in s.get("levels", []) if l["status"] == "TRIGGERED"]
         if lt:
             det += " · retest: " + ", ".join(lt)
@@ -906,7 +1087,7 @@ def render(state, nav=False, auto_page=False):
         steps = [
             ("Scan", "PASS", "gr", f'closed over its {cfg["range_minutes"]}m range'),
             ("News", "LIVE", "gr", f'{len(state["news"])} headlines'),
-            ("Entry", "TRIGGERED", "gr", f'first 5m close over range, {a["entry"]:.2f} at {a["trigger_time"]:%H:%M}'),
+            ("Entry", "TRIGGERED", "gr", f'first {bar_minutes(cfg)}m close over range, {a["entry"]:.2f} at {a["trigger_time"]:%H:%M}'),
             ("Exit", "PLAN", "gr", f'stop {a["stop"]:.2f} · target {a["target"]:.2f} · flat {cfg["flat_by"]}'),
             ("Size", "SIZED" if a["shares"] else "TOO BIG", "gr" if a["shares"] else "rd",
              f'{_money(a["max_loss"])} max loss / {_money(a["risk"])} risk · limit: {a["decided_by"]} = {a["shares"]} sh'),
@@ -917,8 +1098,8 @@ def render(state, nav=False, auto_page=False):
              else f'the setup itself ended {a["result"].lower()} at {a["exit_px"]:.2f}'),
         ]
     else:
-        why = {"WAITING": f'no 5m close over {a.get("range_high", 0):.2f} yet',
-               "NO TRIGGER": f'no 5m close over {a.get("range_high", 0):.2f} before {cfg["entry_cutoff"]}',
+        why = {"WAITING": f'no {bar_minutes(cfg)}m close over {a.get("range_high", 0):.2f} yet',
+               "NO TRIGGER": f'no {bar_minutes(cfg)}m close over {a.get("range_high", 0):.2f} before {cfg["entry_cutoff"]}',
                "BUILDING RANGE": "opening range still forming", "NOT OPEN": "market not open",
                "NO DATA": "no data returned"}.get(a.get("status"), "")
         steps = [("Scan", a.get("status", "-"), STATUS_COL.get(a.get("status"), ""), why),
@@ -1037,7 +1218,7 @@ def render(state, nav=False, auto_page=False):
     qv = state.get("quant") or {}
     qrows = [
         ("VWAP (13.5)", f'{_num(qv.get("vwap"))} · last {_num(qv.get("vs_vwap_pct"), "{:+.2f}%")} vs VWAP'),
-        ("5m volatility (2.1 / 2.3)", f'{_pct(qv.get("sigma5"), 2)} per bar · EWMA {_pct(qv.get("ewma5"), 2)} · '
+        (f"{bar_minutes(cfg)}m volatility (2.1 / 2.3)", f'{_pct(qv.get("sigma5"), 2)} per bar · EWMA {_pct(qv.get("ewma5"), 2)} · '
                                       f'{qv.get("n_rets", 0)} returns'),
         ("Annualized vol (2.2)", _pct(qv.get("ann_vol"), 0)),
         (f'Beta / corr vs {qv.get("beta_vs", "SPY")} (5.2 / 4.2)',
@@ -1068,13 +1249,13 @@ def render(state, nav=False, auto_page=False):
     brow = []
     for st_ in bt["setups"]:
         if not st_.get("n"):
-            brow.append(f'<tr><td>{"&nbsp;&nbsp;" if " " in st_["setup"].replace("LEVEL ", "") else ""}{e(st_["setup"])}</td>'
+            brow.append(f'<tr><td>{"&nbsp;&nbsp;" if ("+" in st_["setup"] or "against" in st_["setup"]) else ""}{e(st_["setup"])}</td>'
                         f'<td class="dim" colspan="11">no triggers</td></tr>')
             continue
         good = st_["avg_r"] > 0
         kel = st_.get("kelly")
         brow.append(
-            f'<tr><td>{"&nbsp;&nbsp;" if " " in st_["setup"].replace("LEVEL ", "") else ""}{e(st_["setup"])}</td><td class="r">{st_["n"]}</td><td class="r">{_pct(st_["hit"], 0)}</td>'
+            f'<tr><td>{"&nbsp;&nbsp;" if ("+" in st_["setup"] or "against" in st_["setup"]) else ""}{e(st_["setup"])}</td><td class="r">{st_["n"]}</td><td class="r">{_pct(st_["hit"], 0)}</td>'
             f'<td class="r {"gr" if good else "rd"}">{st_["avg_r"]:+.2f}R</td><td class="r">{_num(st_.get("profit_factor"))}</td>'
             f'<td class="r">{_num(st_.get("sharpe"))}</td><td class="r">{_num(st_.get("sortino"))}</td>'
             f'<td class="r">{_num(st_.get("t"), "{:+.1f}")}</td><td class="r">{_pct(st_.get("psr"), 0)}</td>'
@@ -1091,16 +1272,18 @@ def render(state, nav=False, auto_page=False):
         f'<div class="b dim">Per trade, in R (1R = the planned loss at the stop; {_money(cfg["budget"] * cfg["max_loss_pct"] / 100)} '
         f'here). Sharpe and Sortino are per trade, not annualized (10.1, 10.2). T-STAT under about 2 and PSR under about 95% '
         f'mean the average could be luck (3.3, 16.4). Kelly (11.1) is the fraction of the account to risk per trade that this '
-        f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of 5-minute bars, so this is a '
+        f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of intraday bars, so this is a '
         f'small sample from one market regime, and testing many setups on it overstates the best one (16.2). '
         f'Only completed sessions are used; the session on screen is never in it (16.1). '
         f'Rows with "+ {"/".join(map(str, cloud_pairs(cfg)[1]))}" keep only the trades where the '
         f'{cfg.get("ema_cloud_minutes", 10)}-minute EMA cloud agreed when the trigger bar closed (price over it for a long, '
         f'under it for a short); "+ {"/".join(map(str, cloud_pairs(cfg)[0]))}" also needs the fast cloud pointing the '
         f'trade\'s way; "against" is the rest. Trades from before the slow EMAs had enough bars are in none of them. '
-        f'They are the same trades as the row above, filtered, not new ones.</div></div>')
+        f'They are the same trades as the row above, filtered, not new ones. BUY / SELL ARROW: entry at the arrow bar\'s '
+        f'close, the setup\'s own stop, target {cfg["target_r_multiple"]}R from there; SELL arrows count even when shorts are '
+        f'watch only.</div></div>')
 
-    head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
+    head = (f'{e(a.get("ticker", "-"))} {bar_minutes(cfg)}-MIN · OPENING RANGE BREAKOUT'
             f'<span>{last_txt} {chg_txt}</span>')
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>ORB Desk · {e(a.get("ticker", ""))}</title>
@@ -1109,13 +1292,13 @@ def render(state, nav=False, auto_page=False):
 <div><span class="gr">PAPER</span> · <span class="am">{mode}</span> · SESSION {session_txt} · AS OF {now:%b %d %H:%M} ET</div></div>
 {navbar}
 <div class="grid">
- <div class="p"><h2>{head}</h2>{_chart(a)}</div>
+ <div class="p"><h2>{head}</h2>{_conf_strip(a, cfg)}{_chart(a)}</div>
  <div>
   <div class="p"><h2>SCANNER<span>watchlist of {len(scans)}</span></h2><div class="b">
    <div class="tiles"><div class="tile"><div class="lab">CHARTS SCANNED</div><div class="big">{len(scans)}</div></div>
    <div class="tile"><div class="lab">CLOSED ABOVE {cfg["range_minutes"]}M RANGE</div><div class="big gr">{n_trig}</div></div>
    <div class="tile"><div class="lab">LEVEL RETEST ENTRIES</div><div class="big" style="color:#6fb7ff">{n_lv}</div></div></div>
-   <table>{"".join(rows)}</table></div></div>
+   <div style="overflow-x:auto"><table>{"".join(rows)}</table></div></div></div>
  </div>
 </div>
 {levels_panel}
@@ -1135,7 +1318,7 @@ def render(state, nav=False, auto_page=False):
  <div class="p"><h2>RISK</h2><table>{risk}</table>{verdict}
   <div class="b dim" style="text-align:center">nothing sends from this page</div></div>
 </div>
-<div class="bar foot"><span><span class="am">DATA</span> Yahoo Finance 5-minute bars and headlines, delayed ·
+<div class="bar foot"><span><span class="am">DATA</span> Yahoo Finance 5-minute bars as {bar_minutes(cfg)}-minute candles, and headlines, delayed ·
  budget {_money(cfg["budget"])} · max loss {cfg["max_loss_pct"]}% · target {cfg["target_r_multiple"]}R ·
  entries until {cfg["entry_cutoff"]} · flat by {cfg["flat_by"]} ET</span>
  <span class="dim">Long side only. A display of a rule, not advice.</span></div>
