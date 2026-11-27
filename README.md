@@ -35,6 +35,15 @@ trend cloud, drawn on the 10-minute chart with premarket and after hours on. Its
 - Settings: `ema_cloud_minutes` (10), `ema_fast_cloud` ([5, 12]), `ema_trend_cloud` ([34, 50]),
   `ema_cloud_extended_hours` (true), `require_ema_cloud` (false), `require_fast_cloud` (false).
 
+## BUY / SELL arrows (confluence)
+Every closed 5-minute bar is scored out of 5 for a long and for a short: close vs VWAP, close vs the 10m 34/50 cloud,
+the 5/12 cloud's direction, close beyond the opening range, and relative volume at or over `confluence_rvol` (1.5x).
+The strip over the chart shows the latest score (`CONFLUENCE L 4/5 | S 1/5`) and which checks are green.
+An arrow needs a setup first (ORB or a level retest; SELL only from PDL / PML retests). From its trigger to the entry
+cutoff, the arrow goes on the first bar whose score reaches `confluence_min` (4) while the setup's stop is untouched.
+One BUY and one SELL per session at most. SELL arrows are marked watch only unless `trade_shorts` is true. The BACKTEST
+has BUY ARROW and SELL ARROW rows: entry at the arrow's close, the setup's stop, target `target_r_multiple` from there.
+
 ## Option ideas (optional, needs Alpaca paper keys)
 For the ticker in focus: calls and puts 2-5 strikes out of the money, expiring within 5 sessions (0DTE included).
 Stop = 15% of the premium; targets at 1:1, 1:2, 1:3. A row is blocked if one contract costs more than the budget,
