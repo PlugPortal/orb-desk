@@ -29,7 +29,31 @@ Keys are read from secrets, never from this repo:
 - Streamlit: app Settings -> Secrets: `ALPACA_API_KEY = "..."` and `ALPACA_SECRET_KEY = "..."`.
 Use paper-account keys only. Do not put keys in any file here; this repo is public.
 
+## Quant panels (`quant.py`)
+Formulas from "The entire math behind quant trading bots" (openvibes.si/quant-math) that fit this desk,
+written in plain Python (still nothing to install). Section numbers match that page.
+- **Chart**: running VWAP line (13.5).
+- **QUANT** (ticker in focus): VWAP and distance from it, 5-minute volatility and EWMA volatility (2.1, 2.3),
+  annualized volatility (2.2), beta and correlation against SPY (5.2, 4.2), trigger-bar relative volume and its
+  z-score (3.1), round-trip cost in R (17.1), break-even win rate after costs (17.3), the no-edge odds of hitting the
+  target before the stop, and how many standard deviations the target and stop are from the last price.
+- **BACKTEST**: the ORB and level-retest rules replayed on the completed earlier sessions in the data, for the
+  whole watchlist, net of costs: win rate, average R, profit factor, Sharpe and Sortino per trade (10.1, 10.2),
+  t-stat (3.3), probabilistic Sharpe (16.4), max drawdown (10.3), expected shortfall (12.3) and Kelly (11.1).
+  Yahoo keeps about 5 days of 5-minute bars, so this is a small sample; read the t-stat and PSR before trusting it.
+- **Option ideas**: implied volatility from the mid quote (15.5), delta and theta (15.4), bid-ask spread (13.1),
+  breakeven at expiry. Black-Scholes with no dividends.
+- Run `python3 test_quant.py` to check the formulas against textbook values.
+
+Not used, because they don't fit a long-side 5-minute breakout desk: GARCH, Ledoit-Wolf shrinkage, cointegration
+and pairs trading, Ornstein-Uhlenbeck, Kalman filter, cross-sectional momentum, market making (Avellaneda-Stoikov),
+order-book imbalance and order-flow imbalance (Yahoo gives no order book).
+
 ## Settings (`config.json`)
+New: `slippage_per_share` (0.01, each way), `commission_per_trade` (0), `risk_free_rate` (0.04, used for option
+IV; update it when rates change), `require_above_vwap` (false; true adds "entry above VWAP" to the risk check),
+`min_rvol` (0 = off; e.g. 1.5 requires the trigger bar to trade 1.5x its usual volume), `beta_vs` ("SPY").
+
 `budget` 500, `max_loss_pct` 15, `target_r_multiple` 2, `entry_cutoff`, `flat_by`, `watchlist`,
 and `ticker` ("AUTO" picks the first watchlist breakout that passes the risk check, or name one ticker).
 

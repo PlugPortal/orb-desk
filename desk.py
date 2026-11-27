@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
+import quant as q
+
 NY = ZoneInfo("America/New_York")
 UA = {"User-Agent": "Mozilla/5.0 (orb-desk)"}
 BAR = dt.timedelta(minutes=5)
@@ -119,8 +121,18 @@ def split_sessions(bars):
     return days
 
 
-def analyze(day_bars, prev_close, cfg, now):
-    """Opening-range breakout on one session. Returns a dict; never raises on thin data."""
+def rvol_at(bar, history):
+    """Relative volume of a bar: its volume over the average volume of the same 5-minute slot on earlier sessions,
+    plus the z-score (3.1) of that volume against those same slots."""
+    same = [b["v"] for day in history for b in day if b["t"].time() == bar["t"].time() and b["v"]]
+    if not same or not bar["v"]:
+        return None, None
+    return bar["v"] / (sum(same) / len(same)), q.zscore(bar["v"], same)
+
+
+def analyze(day_bars, prev_close, cfg, now, history=None):
+    """Opening-range breakout on one session. Returns a dict; never raises on thin data.
+    `history` = earlier sessions' bars (oldest first), used only for relative volume."""
     out = {"status": "NO DATA", "bars": [], "prev_close": prev_close}
     if not day_bars:
         return out
@@ -133,6 +145,7 @@ def analyze(day_bars, prev_close, cfg, now):
         return out
     out["last"] = done[-1]["c"]
     out["last_time"] = done[-1]["t"] + BAR
+    out["vwap"] = q.vwap(done)
     if prev_close:
         out["chg_pct"] = (out["last"] / prev_close - 1) * 100
 
@@ -167,6 +180,10 @@ def analyze(day_bars, prev_close, cfg, now):
     cost = round(shares * entry, 2)
     loss_at_stop = round(shares * risk, 2)
     rr = round((target - entry) / risk, 2) if risk > 0 else 0
+    vwap_t = q.vwap([b for b in done if b["t"] <= trig["t"]])
+    rvol, vol_z = rvol_at(trig, history or [])
+    cost_r = q.cost_in_r(risk, cfg.get("slippage_per_share", 0.01), cfg.get("commission_per_trade", 0.0), shares or 1)
+    be_hit = q.breakeven_hit_rate(rr, cost_r or 0) if rr > 0 else None
 
     checks = [
         ("Stop below entry", risk > 0, f"{stop:.2f} vs {entry:.2f}"),
@@ -176,6 +193,13 @@ def analyze(day_bars, prev_close, cfg, now):
         ("Cost within budget", cost <= cfg["budget"], f"${cost:,.2f} / ${cfg['budget']:,.2f}"),
         ("Entry window", trig["t"] + BAR <= cutoff, f"by {cfg['entry_cutoff']}"),
     ]
+    # optional filters, off unless switched on in config.json
+    if cfg.get("require_above_vwap"):
+        checks.append(("Entry above VWAP", vwap_t is not None and entry > vwap_t,
+                       f"{entry:.2f} vs {vwap_t:.2f}" if vwap_t else "no volume"))
+    if cfg.get("min_rvol"):
+        checks.append(("Relative volume", rvol is not None and rvol >= cfg["min_rvol"],
+                       f"{rvol:.1f}x / {cfg['min_rvol']}x" if rvol else "no history"))
     verdict = "PASS" if all(ok for _, ok, _ in checks) else "BLOCK"
 
     # what happened after the trigger (only meaningful once later bars exist)
@@ -199,6 +223,8 @@ def analyze(day_bars, prev_close, cfg, now):
         result=result, exit_px=exit_px, exit_time=exit_time,
         pnl=round(shares * (exit_px - entry), 2) + 0.0,
         over_high_pct=(entry / hi - 1) * 100,
+        vwap_at_entry=vwap_t, rvol=rvol, vol_z=vol_z, cost_r=cost_r, breakeven_hit=be_hit,
+        r_result=(exit_px - entry) / risk if risk > 0 else None,
     )
     return out
 
@@ -297,7 +323,8 @@ def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
                  target=target, risk=risk, shares=shares, cost=round(shares * entry, 2),
                  loss_at_stop=round(shares * risk, 2), verdict=verdict, result=result,
                  exit_px=exit_px, exit_time=exit_time,
-                 pnl=round(shares * sg * (exit_px - entry), 2) + 0.0)
+                 pnl=round(shares * sg * (exit_px - entry), 2) + 0.0,
+                 r_result=sg * (exit_px - entry) / risk if risk > 0 else None)
     return out
 
 
@@ -332,7 +359,7 @@ def _alpaca_chain(ticker, lo, hi, d0, d1):
     return snaps
 
 
-def option_ideas(ticker, spot, cfg, today, chain=None):
+def option_ideas(ticker, spot, cfg, today, chain=None, now=None):
     """Out-of-the-money calls and puts for the next few sessions, sized to the budget.
 
     Stop is a percent of the premium paid (ask); targets are 1x, 2x, 3x that risk.
@@ -375,6 +402,7 @@ def option_ideas(ticker, spot, cfg, today, chain=None):
                     continue
                 row = {"symbol": sym, "expiry": exp, "dte": (exp - today).days, "strike": strike, "otm": i,
                        "bid": bid, "ask": ask}
+                row.update(_option_math(kind, spot, strike, bid, ask, exp, now, cfg))
                 if ask <= 0:
                     row.update(verdict="BLOCK", reason="no quote", qty=0)
                 else:
@@ -392,6 +420,31 @@ def option_ideas(ticker, spot, cfg, today, chain=None):
                     else:
                         row.update(verdict="PASS", reason="")
                 out[name].append(row)
+    return out
+
+
+def _option_math(kind, spot, strike, bid, ask, exp, now, cfg):
+    """13.1 spread, 15.5 implied vol from the mid, 15.4 delta and theta. Black-Scholes, no dividends."""
+    if ask <= 0:
+        return {}
+    now = now or dt.datetime.now(NY)
+    T = (dt.datetime.combine(exp, dt.time(16, 0), NY) - now).total_seconds() / (365 * 86400)
+    T = max(T, 15 * 60 / (365 * 86400))                          # floor at 15 minutes so 0DTE near the bell stays finite
+    r = cfg.get("risk_free_rate", 0.04)
+    mid = (bid + ask) / 2 if bid > 0 else ask
+    out = {"mid": mid, "spread_pct": q.spread_pct(bid, ask),
+           "breakeven": strike + ask if kind == "C" else strike - ask}
+    if mid < cfg.get("iv_min_premium", 0.05):                    # a quote of a few cents is mostly rounding: IV would be noise
+        return out
+    iv = q.implied_vol(mid, spot, strike, T, r, kind)
+    if iv:
+        g = q.bs_greeks(spot, strike, T, r, iv, kind)
+        out.update(iv=iv, delta=g["delta"])
+        if T * 365 < 1:                                          # under a day left: decay = all remaining time value
+            intrinsic = max(0.0, spot - strike) if kind == "C" else max(0.0, strike - spot)
+            out["theta_day"] = -max(0.0, mid - intrinsic) * 100
+        else:
+            out["theta_day"] = g["theta"] / 365 * 100            # $ per contract per calendar day
     return out
 
 
@@ -416,11 +469,90 @@ def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
     # Yahoo's own previous close is the official one; use it only for the live/latest session
     if meta.get("previousClose") and day == max(days):
         prev_close = meta["previousClose"]
-    a = analyze(days[day], prev_close, cfg, now)
+    a = analyze(days[day], prev_close, cfg, now, history=[days[d] for d in dates[:-1]])
     a["levels"] = analyze_levels(days[day], days[prior] if prior else [], meta.get("pre_bars", []), cfg, now)
     a["ticker"] = ticker
     a["name"] = meta.get("shortName") or ticker
+    a["_days"] = {d: days[d] for d in dates}                      # kept for beta / volatility on the focus ticker
+    a["history"] = backtest_sessions(ticker, days, dates[:-1], meta.get("pre_bars", []), cfg)
     return a
+
+
+def backtest_sessions(ticker, days, past_dates, pre_bars, cfg):
+    """16.1 No look-ahead: replay the same rules on each COMPLETED earlier session only (never the one in focus).
+    Returns one row per trigger with its result in R (1R = the planned loss at the stop)."""
+    rows = []
+    for i, d in enumerate(past_dates):
+        end = dt.datetime.combine(d, dt.time(16, 5), NY)
+        prior = days[past_dates[i - 1]] if i else []
+        prev_close = prior[-1]["c"] if prior else None
+        a = analyze(days[d], prev_close, cfg, end, history=[days[x] for x in past_dates[:i]])
+        if a.get("status") == "TRIGGERED" and a.get("r_result") is not None:
+            rows.append({"setup": "ORB", "ticker": ticker, "t": a["trigger_time"], "r": a["r_result"],
+                         "cost_r": a["cost_r"] or 0.0, "result": a["result"]})
+        for l in analyze_levels(days[d], prior, pre_bars, cfg, end):
+            if l.get("status") == "TRIGGERED" and l.get("r_result") is not None:
+                c = q.cost_in_r(l["risk"], cfg.get("slippage_per_share", 0.01),
+                                cfg.get("commission_per_trade", 0.0), l["shares"] or 1) or 0.0
+                rows.append({"setup": "LEVEL " + l["side"], "ticker": ticker, "t": l["trigger_time"],
+                             "r": l["r_result"], "cost_r": c, "result": l["result"]})
+    return rows
+
+
+def backtest_summary(scans, cfg):
+    """Pools every past trigger across the watchlist and summarises it per setup (sections 10, 11, 12, 16, 17)."""
+    rows = sorted((r for s in scans for r in s.get("history", [])), key=lambda r: r["t"])
+    out = []
+    for setup in ("ORB", "LEVEL LONG", "LEVEL SHORT"):
+        rs = [r for r in rows if r["setup"] == setup]
+        net = [r["r"] - r["cost_r"] for r in rs]
+        st = q.trade_stats(net)
+        st["setup"] = setup
+        st["gross_avg_r"] = q.mean([r["r"] for r in rs]) if rs else None
+        st["sessions"] = len({r["t"].date() for r in rs})
+        st["avg_cost_r"] = q.mean([r["cost_r"] for r in rs]) if rs else None
+        out.append(st)
+    dates = sorted({d for s in scans for d in list(s.get("_days", {}))[:-1]})
+    return {"setups": out, "sessions": dates}
+
+
+def focus_quant(focus, scans, cfg, now):
+    """Numbers for the QUANT panel on the ticker in focus."""
+    days = focus.get("_days") or {}
+    if not days or not focus.get("bars"):
+        return {}
+    closes_by_day = [[b["c"] for b in bs] for _, bs in sorted(days.items())]
+    rets = [r for cl in closes_by_day for r in q.log_returns(cl)]   # within-session 5m returns, no overnight gaps
+    sig = q.stdev(rets)
+    out = {"sigma5": sig, "ewma5": q.ewma_vol(rets), "ann_vol": q.annualize_vol(sig, q.BARS_PER_DAY * q.DAYS_PER_YEAR),
+           "n_rets": len(rets), "vwap": focus.get("vwap")}
+    if focus.get("vwap") and focus.get("last"):
+        out["vs_vwap_pct"] = (focus["last"] / focus["vwap"] - 1) * 100
+    # 4.2 / 5.2 against SPY, on 5-minute returns matched by timestamp
+    spy = next((s for s in scans if s["ticker"] == cfg.get("beta_vs", "SPY")), None)
+    if spy and spy is not focus and spy.get("_days"):
+        def rmap(dd):
+            m = {}
+            for bs in dd.values():
+                for a, b in zip(bs, bs[1:]):
+                    if a["c"] > 0 and b["c"] > 0:
+                        m[b["t"]] = math.log(b["c"] / a["c"])
+            return m
+        fa, fm = rmap(days), rmap(spy["_days"])
+        common = sorted(set(fa) & set(fm))
+        out["corr"], out["beta"] = q.corr_beta([fa[t] for t in common], [fm[t] for t in common])
+        out["beta_vs"] = spy["ticker"]
+    if focus.get("status") == "TRIGGERED" and sig:
+        last, flat_t = focus["last"], focus["flat_t"]
+        bars_left = max(0, int((flat_t - max(now, focus["last_time"])) / BAR))
+        out["bars_left"] = bars_left
+        if focus.get("result") == "OPEN" and bars_left:
+            move = last * sig * math.sqrt(bars_left)              # 2.2 square-root-of-time, in dollars
+            out["target_sigmas"] = (focus["target"] - last) / move
+            out["stop_sigmas"] = (last - focus["stop"]) / move
+            out["rw_target_first"] = q.random_walk_hit_first(last, focus["stop"], focus["target"])
+        out["rw_at_entry"] = q.random_walk_hit_first(focus["entry"], focus["stop"], focus["target"])
+    return out
 
 
 def build_state(cfg, now=None, session_date=None):
@@ -443,13 +575,15 @@ def build_state(cfg, now=None, session_date=None):
         "news": fetch_news(focus["ticker"]),
         "live": live,
         "options": _focus_options(focus, cfg, now, live),
+        "quant": focus_quant(focus, scans, cfg, now),
+        "backtest": backtest_summary(scans, cfg),
     }
 
 
 def _focus_options(focus, cfg, now, live):
     if not live or "last" not in focus:
         return {"status": "REPLAY", "calls": [], "puts": []}
-    return option_ideas(focus["ticker"], focus["last"], cfg, now.date())
+    return option_ideas(focus["ticker"], focus["last"], cfg, now.date(), now=now)
 
 
 # ---------------------------------------------------------------- page
@@ -468,7 +602,7 @@ text-align:left;white-space:nowrap}th{color:#f5a623;font-weight:600}td.r,th.r{te
 .big{font-size:34px;font-weight:700;line-height:1.1}.tile{border:1px solid #3a2f16;padding:8px 10px;flex:1}
 .tiles{display:flex;gap:10px;margin-bottom:10px}.lab{color:#8a7a55;font-size:11px;letter-spacing:.08em}
 .verdict{text-align:center;font-size:40px;font-weight:700;margin:14px 0 4px}
-.news td{white-space:normal}.foot{margin-top:12px;font-size:12px}
+.news td,.wrap td{white-space:normal}.foot{margin-top:12px;font-size:12px}
 .note{border:1px dashed #f5a623;padding:8px 10px;margin-top:10px;text-align:center}
 svg{display:block;width:100%;height:auto}
 .nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}
@@ -479,7 +613,15 @@ svg{display:block;width:100%;height:auto}
 
 
 def _money(x):
-    return f"${x:,.2f}"
+    return f"-${-x:,.2f}" if x < 0 else f"${x:,.2f}"
+
+
+def _pct(x, d=1):
+    return "-" if x is None else f"{x * 100:.{d}f}%"
+
+
+def _num(x, fmt="{:.2f}"):
+    return "-" if x is None else fmt.format(x)
 
 
 def _chart(a):
@@ -525,6 +667,11 @@ def _chart(a):
                  f'stroke-dasharray="2 4" opacity=".9"/>'
                  f'<text x="{W-R-4}" y="{y(l["level"])-4:.1f}" fill="#6fb7ff" font-size="11" text-anchor="end">'
                  f'{l["name"]} {l["level"]:.2f}</text>')
+    vw = q.vwap_series(bars)                                     # 13.5 running VWAP
+    pts = [f'{xi(b["t"]) + step / 2:.1f},{y(v):.1f}' for b, v in zip(bars, vw) if v is not None and lo <= v <= hi]
+    if len(pts) > 1:
+        s.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#c38cff" stroke-width="1.3" opacity=".9"/>'
+                 f'<text x="{L + 4}" y="{H - 30}" fill="#c38cff" font-size="11">VWAP {vw[-1]:.2f}</text>')
     if a.get("status") == "TRIGGERED":
         x1 = xi(a["trigger_time"])
         s.append(f'<rect x="{x1:.1f}" y="{y(a["target"]):.1f}" width="{W-R-x1:.1f}" '
@@ -555,7 +702,8 @@ def with_focus(state, ticker):
     """Same scan, different ticker in focus (used to build one static page per watchlist name)."""
     focus = next(s for s in state["scans"] if s["ticker"] == ticker)
     return dict(state, focus=focus, news=fetch_news(ticker),
-                options=_focus_options(focus, state["cfg"], state["now"], state["live"]))
+                options=_focus_options(focus, state["cfg"], state["now"], state["live"]),
+                quant=focus_quant(focus, state["scans"], state["cfg"], state["now"]))
 
 
 def render(state, nav=False, auto_page=False):
@@ -686,7 +834,7 @@ def render(state, nav=False, auto_page=False):
     osp = cfg.get("option_stop_pct", 15)
 
     def opt_rows(rows, live_names, label):
-        hdr = (f'<tr><td colspan="12" class="am">{label} · '
+        hdr = (f'<tr><td colspan="17" class="am">{label} · '
                + (f'<span class="gr">live trigger: {", ".join(live_names)}</span>' if live_names
                   else '<span class="dim">no live trigger</span>') + '</td></tr>')
         body = []
@@ -699,18 +847,30 @@ def render(state, nav=False, auto_page=False):
                          f'<td class="r">{r["qty"]}</td>')
             else:
                 base += '<td colspan="6"></td>'
+            sp_ = r.get("spread_pct")
+            dl = "" if r.get("delta") is None else f'{r["delta"]:+.2f}'
+            th = "" if r.get("theta_day") is None else _money(r["theta_day"])
+            be = "" if "breakeven" not in r else f'{r["breakeven"]:.2f}'
+            wide = "rd" if sp_ and sp_ > 0.10 else ""
+            base += (f'<td class="r">{_pct(r.get("iv"), 0)}</td><td class="r">{dl}</td>'
+                     f'<td class="r rd">{th}</td><td class="r {wide}">{_pct(sp_, 0)}</td><td class="r">{be}</td>')
             vc = "gr" if r["verdict"] == "PASS" else "rd"
             body.append(f'<tr>{base}<td class="{vc}">{r["verdict"]}{" · " + r["reason"] if r["reason"] else ""}</td></tr>')
-        return hdr + ("".join(body) or '<tr><td colspan="12" class="dim">no contracts in range</td></tr>')
+        return hdr + ("".join(body) or '<tr><td colspan="17" class="dim">no contracts in range</td></tr>')
 
     if op["status"] == "OK":
         obody = ('<div style="overflow-x:auto"><table><tr><th>EXPIRY</th><th class="r">STRIKE</th><th></th><th class="r">BID</th>'
                  f'<th class="r">ASK</th><th class="r">COST x1</th><th class="r">STOP -{osp}%</th><th class="r">1:1</th>'
-                 '<th class="r">1:2</th><th class="r">1:3</th><th class="r">QTY</th><th>RISK</th></tr>'
+                 '<th class="r">1:2</th><th class="r">1:3</th><th class="r">QTY</th>'
+                 '<th class="r">IV</th><th class="r">DELTA</th><th class="r">THETA/DAY</th><th class="r">SPREAD</th>'
+                 '<th class="r">BREAKEVEN</th><th>RISK</th></tr>'
                  + opt_rows(op["calls"], long_live, "CALLS for long setups")
                  + opt_rows(op["puts"], short_live, "PUTS for short setups") + '</table></div>'
                  '<div class="b dim">Indicative quotes from Alpaca: delayed and adjusted, not tradable prices. '
-                 'Cost assumes buying at the ask. Untested idea: no historical option data was available to test this rule.</div>')
+                 'Cost assumes buying at the ask. Untested idea: no historical option data was available to test this rule. '
+                 f'IV, delta and theta are Black-Scholes from the mid quote (no dividends, rate {cfg.get("risk_free_rate", 0.04):.1%}); '
+                 'theta is dollars per contract per calendar day (for 0DTE: all the time value left, gone by the close); '
+                 'IV is left blank under 5 cents of premium; breakeven is at expiry. A spread over 10% is shown in red.</div>')
     else:
         why = {"NO KEYS": "Add your Alpaca paper keys as secrets to switch this panel on (see README).",
                "REPLAY": "Option quotes are shown for the live session only."}.get(
@@ -721,6 +881,65 @@ def render(state, nav=False, auto_page=False):
         f'{cfg.get("option_otm_min", 2)}-{cfg.get("option_otm_max", 5)} strikes OTM · expiring within '
         f'{cfg.get("option_days", 5)} sessions incl. 0DTE · stop {osp}% of premium</span></h2>{obody}</div>')
     n_lv = sum(1 for s in scans for l in s.get("levels", []) if l["status"] == "TRIGGERED")
+
+    # ---- QUANT: the formulas applied to the ticker in focus
+    qv = state.get("quant") or {}
+    qrows = [
+        ("VWAP (13.5)", f'{_num(qv.get("vwap"))} · last {_num(qv.get("vs_vwap_pct"), "{:+.2f}%")} vs VWAP'),
+        ("5m volatility (2.1 / 2.3)", f'{_pct(qv.get("sigma5"), 2)} per bar · EWMA {_pct(qv.get("ewma5"), 2)} · '
+                                      f'{qv.get("n_rets", 0)} returns'),
+        ("Annualized vol (2.2)", _pct(qv.get("ann_vol"), 0)),
+        (f'Beta / corr vs {qv.get("beta_vs", "SPY")} (5.2 / 4.2)',
+         f'{_num(qv.get("beta"))} / {_num(qv.get("corr"))}' if "beta_vs" in qv else "SPY not on the watchlist"),
+    ]
+    if trig:
+        qrows += [
+            ("VWAP at entry", f'{_num(a.get("vwap_at_entry"))} · entry {"above" if a.get("vwap_at_entry") and a["entry"] > a["vwap_at_entry"] else "below"}'),
+            ("Trigger-bar volume (3.1)", f'{_num(a.get("rvol"), "{:.1f}x")} same-slot average · z {_num(a.get("vol_z"), "{:+.1f}")}'),
+            ("Costs in R (17.1)", f'{_num(a.get("cost_r"), "{:.3f}R")} round trip at ${cfg.get("slippage_per_share", 0.01):.2f}/share slippage each way'),
+            ("Break-even win rate (17.3)", f'{_pct(a.get("breakeven_hit"), 1)} at {a["rr"]:.0f}R after costs'),
+            ("No-edge odds of target first", f'{_pct(qv.get("rw_at_entry"), 0)} at entry'
+                                             + (f' · {_pct(qv.get("rw_target_first"), 0)} from last price' if "rw_target_first" in qv else "")),
+        ]
+        if "target_sigmas" in qv:
+            qrows.append(("Distance to close (2.2)", f'target {qv["target_sigmas"]:.1f} sd away, stop {qv["stop_sigmas"]:.1f} sd, '
+                                                      f'{qv["bars_left"]} bars left'))
+    quant_panel = ('<div class="p"><h2>QUANT<span>formulas on the ticker in focus</span></h2><table class="wrap">'
+                   + "".join(f'<tr><td class="am">{e(k)}</td><td class="r">{e(v)}</td></tr>' for k, v in qrows)
+                   + '</table><div class="b dim">No-edge odds: on a random walk with no drift, price reaches the target '
+                     'before the stop (entry - stop) / (target - stop) of the time; a real edge has to beat that, and beat '
+                     'the break-even win rate after costs.</div></div>')
+
+    # ---- BACKTEST: the same rules on the completed earlier sessions in the data
+    bt = state.get("backtest") or {"setups": [], "sessions": []}
+    brow = []
+    for st_ in bt["setups"]:
+        if not st_.get("n"):
+            brow.append(f'<tr><td>{e(st_["setup"])}</td><td class="dim" colspan="11">no triggers</td></tr>')
+            continue
+        good = st_["avg_r"] > 0
+        kel = st_.get("kelly")
+        brow.append(
+            f'<tr><td>{e(st_["setup"])}</td><td class="r">{st_["n"]}</td><td class="r">{_pct(st_["hit"], 0)}</td>'
+            f'<td class="r {"gr" if good else "rd"}">{st_["avg_r"]:+.2f}R</td><td class="r">{_num(st_.get("profit_factor"))}</td>'
+            f'<td class="r">{_num(st_.get("sharpe"))}</td><td class="r">{_num(st_.get("sortino"))}</td>'
+            f'<td class="r">{_num(st_.get("t"), "{:+.1f}")}</td><td class="r">{_pct(st_.get("psr"), 0)}</td>'
+            f'<td class="r rd">{st_["max_dd"]:.1f}R</td><td class="r">{_num(st_.get("es95"), "{:.2f}R")}</td>'
+            f'<td class="r">{"-" if kel is None else ("none" if kel <= 0 else _pct(kel, 1))}</td></tr>')
+    sess = bt["sessions"]
+    span = f'{sess[0]:%b %d}-{sess[-1]:%b %d}, {len(sess)} sessions' if sess else "no completed sessions"
+    backtest_panel = (
+        f'<div class="p"><h2>BACKTEST<span>same rules on earlier sessions · {span} · whole watchlist · net of costs</span></h2>'
+        '<div style="overflow-x:auto"><table><tr><th>SETUP</th><th class="r">TRADES</th><th class="r">WIN</th>'
+        '<th class="r">AVG</th><th class="r">PF</th><th class="r">SHARPE</th><th class="r">SORTINO</th>'
+        '<th class="r">T-STAT</th><th class="r">PSR</th><th class="r">MAX DD</th><th class="r">ES 95%</th>'
+        '<th class="r">KELLY</th></tr>' + "".join(brow) + '</table></div>'
+        f'<div class="b dim">Per trade, in R (1R = the planned loss at the stop; {_money(cfg["budget"] * cfg["max_loss_pct"] / 100)} '
+        f'here). Sharpe and Sortino are per trade, not annualized (10.1, 10.2). T-STAT under about 2 and PSR under about 95% '
+        f'mean the average could be luck (3.3, 16.4). Kelly (11.1) is the fraction of the account to risk per trade that this '
+        f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of 5-minute bars, so this is a '
+        f'small sample from one market regime, and testing many setups on it overstates the best one (16.2). '
+        f'Only completed sessions are used; the session on screen is never in it (16.1).</div></div>')
 
     head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
             f'<span>{last_txt} {chg_txt}</span>')
@@ -742,6 +961,10 @@ def render(state, nav=False, auto_page=False):
 </div>
 {levels_panel}
 {options_panel}
+<div class="grid">
+ {backtest_panel}
+ {quant_panel}
+</div>
 <div class="grid">
  <div class="p"><h2>PIPELINE<span>each step feeds the next</span></h2>
   <table><tr><th>STEP</th><th>STATUS</th><th>DETAIL</th></tr>{pipe}</table></div>
