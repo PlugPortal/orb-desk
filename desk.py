@@ -4,6 +4,7 @@ Standard library only. Used by both app.py (Streamlit) and build_page.py (GitHub
 Data: Yahoo Finance chart JSON and Yahoo Finance RSS headlines (free, delayed, no key).
 Long side only. This page displays a plan; it never places an order.
 """
+import bisect
 import datetime as dt
 import html
 import json
@@ -56,7 +57,7 @@ def parse_chart(raw):
     res = json.loads(raw)["chart"]["result"][0]
     meta = res.get("meta", {})
     q = res["indicators"]["quote"][0]
-    bars, pre = [], []
+    bars, pre, post = [], [], []
     for i, ts in enumerate(res.get("timestamp") or []):
         o, h, l, c, v = (q[k][i] for k in ("open", "high", "low", "close", "volume"))
         if None in (o, h, l, c):
@@ -67,7 +68,10 @@ def parse_chart(raw):
             pre.append(bar)                                      # premarket, used for PMH / PML
         elif dt.time(9, 30) <= t.time() < dt.time(16, 0):
             bars.append(bar)
+        elif dt.time(16, 0) <= t.time() < dt.time(20, 0):
+            post.append(bar)                                     # after hours, used only for the EMA clouds
     meta["pre_bars"] = pre
+    meta["post_bars"] = post
     return meta, bars
 
 
@@ -130,9 +134,67 @@ def rvol_at(bar, history):
     return bar["v"] / (sum(same) / len(same)), q.zscore(bar["v"], same)
 
 
-def analyze(day_bars, prev_close, cfg, now, history=None):
+# ---------------------------------------------------------------- EMA clouds (Ripster)
+def cloud_pairs(cfg):
+    """(fast cloud, trend cloud) as (short, long) EMA lengths. Ripster's core set: 5/12 for momentum and the
+    34/50 as the trend cloud ("never long under the 10-min 34/50")."""
+    return tuple(cfg.get("ema_fast_cloud", [5, 12])), tuple(cfg.get("ema_trend_cloud", [34, 50]))
+
+
+def build_clouds(bars, cfg):
+    """EMA clouds on `ema_cloud_minutes` bars (10 by default, the timeframe Ripster uses for day trades),
+    built from every bar given (all sessions, oldest first) so the slow EMAs carry over from day to day.
+    Returns the resampled bars, each with "ema" = {(a, b): (ema_a, ema_b)} and "end" = its close time."""
+    rb = q.resample(sorted(bars, key=lambda b: b["t"]), int(cfg.get("ema_cloud_minutes", 10)))
+    closes = [b["c"] for b in rb]
+    lens = {n for pair in cloud_pairs(cfg) for n in pair}
+    ema = {n: q.ema_series(closes, n) for n in lens}
+    for i, b in enumerate(rb):
+        b["ema"] = {pair: (ema[pair[0]][i], ema[pair[1]][i]) for pair in cloud_pairs(cfg)}
+    return rb
+
+
+def cloud_at(clouds, when):
+    """EMA values from the last cloud bar that had CLOSED by `when` (no look-ahead). None before the first one."""
+    if not clouds:
+        return None
+    i = bisect.bisect_right([c["end"] for c in clouds], when) - 1
+    return clouds[i]["ema"] if i >= 0 else None
+
+
+def cloud_agrees(ema, pair, price, side, strict):
+    """Does this cloud agree with a trade at `price`? strict (trend cloud): price must be over the whole cloud for a
+    long, under it for a short. Not strict (fast cloud): the cloud must point the trade's way (fast EMA over slow for
+    a long) and price must not be on the wrong side of it. None while the EMAs are still warming up."""
+    pos, bull = q.cloud_state(price, *(ema or {}).get(pair, (None, None)))
+    if pos is None:
+        return None
+    if side == "LONG":
+        return pos == "above" if strict else (bull and pos != "below")
+    return pos == "below" if strict else ((not bull) and pos != "above")
+
+
+def cloud_checks(ema, price, side, cfg):
+    """(fast_ok, trend_ok) plus the optional risk-check rows switched on in config.json."""
+    fast, trend = cloud_pairs(cfg)
+    f_ok, t_ok = cloud_agrees(ema, fast, price, side, False), cloud_agrees(ema, trend, price, side, True)
+    m = cfg.get("ema_cloud_minutes", 10)
+    word = "over" if side == "LONG" else "under"
+    rows = []
+    if cfg.get("require_ema_cloud"):
+        rows.append((f"{m}m {trend[0]}/{trend[1]} cloud", bool(t_ok),
+                     f"{word} the cloud" if t_ok else ("cloud warming up" if t_ok is None else f"not {word} the cloud")))
+    if cfg.get("require_fast_cloud"):
+        rows.append((f"{m}m {fast[0]}/{fast[1]} cloud", bool(f_ok),
+                     ("points " + ("up" if side == "LONG" else "down")) if f_ok
+                     else ("cloud warming up" if f_ok is None else "against the trade")))
+    return f_ok, t_ok, rows
+
+
+def analyze(day_bars, prev_close, cfg, now, history=None, clouds=None):
     """Opening-range breakout on one session. Returns a dict; never raises on thin data.
-    `history` = earlier sessions' bars (oldest first), used only for relative volume."""
+    `history` = earlier sessions' bars (oldest first), used only for relative volume.
+    `clouds` = output of build_clouds(), used for the optional EMA cloud checks."""
     out = {"status": "NO DATA", "bars": [], "prev_close": prev_close}
     if not day_bars:
         return out
@@ -200,6 +262,9 @@ def analyze(day_bars, prev_close, cfg, now, history=None):
     if cfg.get("min_rvol"):
         checks.append(("Relative volume", rvol is not None and rvol >= cfg["min_rvol"],
                        f"{rvol:.1f}x / {cfg['min_rvol']}x" if rvol else "no history"))
+    ema_t = cloud_at(clouds, trig["t"] + BAR)                    # clouds as they stood when the trigger bar closed
+    fast_ok, trend_ok, crow = cloud_checks(ema_t, entry, "LONG", cfg)
+    checks += crow
     verdict = "PASS" if all(ok for _, ok, _ in checks) else "BLOCK"
 
     # what happened after the trigger (only meaningful once later bars exist)
@@ -224,12 +289,13 @@ def analyze(day_bars, prev_close, cfg, now, history=None):
         pnl=round(shares * (exit_px - entry), 2) + 0.0,
         over_high_pct=(entry / hi - 1) * 100,
         vwap_at_entry=vwap_t, rvol=rvol, vol_z=vol_z, cost_r=cost_r, breakeven_hit=be_hit,
+        ema_at_entry=ema_t, fast_ok=fast_ok, trend_ok=trend_ok,
         r_result=(exit_px - entry) / risk if risk > 0 else None,
     )
     return out
 
 
-def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
+def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now, clouds=None):
     """Second setup: retest of the prior-day high/low and premarket high/low.
 
     Long above PDH / PMH, short below PDL / PML. A level must first be broken by a 5-minute
@@ -304,6 +370,8 @@ def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
         by_budget = math.floor(cfg["budget"] / entry)
         shares = max(0, min(by_loss, by_budget))
         ok = shares >= 1 and round(shares * risk, 2) <= max_loss and shares * entry <= cfg["budget"]
+        fast_ok, trend_ok, crow = cloud_checks(cloud_at(clouds, done[ei]["t"] + BAR), entry, side, cfg)
+        ok = ok and all(c_ok for _, c_ok, _ in crow)
         if side == "SHORT" and not cfg.get("trade_shorts", False):
             verdict = "WATCH ONLY"
         else:
@@ -322,7 +390,8 @@ def analyze_levels(day_bars, prior_bars, pre_bars, cfg, now):
         r.update(status="TRIGGERED", trigger_time=done[ei]["t"] + BAR, entry=entry, stop=stop,
                  target=target, risk=risk, shares=shares, cost=round(shares * entry, 2),
                  loss_at_stop=round(shares * risk, 2), verdict=verdict, result=result,
-                 exit_px=exit_px, exit_time=exit_time,
+                 exit_px=exit_px, exit_time=exit_time, fast_ok=fast_ok, trend_ok=trend_ok,
+                 cloud_fail=[n for n, c_ok, _ in crow if not c_ok],
                  pnl=round(shares * sg * (exit_px - entry), 2) + 0.0,
                  r_result=sg * (exit_px - entry) / risk if risk > 0 else None)
     return out
@@ -469,16 +538,21 @@ def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
     # Yahoo's own previous close is the official one; use it only for the live/latest session
     if meta.get("previousClose") and day == max(days):
         prev_close = meta["previousClose"]
-    a = analyze(days[day], prev_close, cfg, now, history=[days[d] for d in dates[:-1]])
-    a["levels"] = analyze_levels(days[day], days[prior] if prior else [], meta.get("pre_bars", []), cfg, now)
+    ext = cfg.get("ema_cloud_extended_hours", True)              # Ripster keeps premarket / after hours on
+    cbars = bars + (meta.get("pre_bars", []) + meta.get("post_bars", []) if ext else [])
+    clouds = build_clouds([b for b in cbars if b["t"].date() <= day], cfg)
+    a = analyze(days[day], prev_close, cfg, now, history=[days[d] for d in dates[:-1]], clouds=clouds)
+    a["levels"] = analyze_levels(days[day], days[prior] if prior else [], meta.get("pre_bars", []), cfg, now, clouds)
+    a["cloud_bars"] = [cloud_at(clouds, b["t"] + BAR) for b in a["bars"]]
+    a["cloud_now"] = a["cloud_bars"][-1] if a["cloud_bars"] else None
     a["ticker"] = ticker
     a["name"] = meta.get("shortName") or ticker
     a["_days"] = {d: days[d] for d in dates}                      # kept for beta / volatility on the focus ticker
-    a["history"] = backtest_sessions(ticker, days, dates[:-1], meta.get("pre_bars", []), cfg)
+    a["history"] = backtest_sessions(ticker, days, dates[:-1], meta.get("pre_bars", []), cfg, clouds)
     return a
 
 
-def backtest_sessions(ticker, days, past_dates, pre_bars, cfg):
+def backtest_sessions(ticker, days, past_dates, pre_bars, cfg, clouds=None):
     """16.1 No look-ahead: replay the same rules on each COMPLETED earlier session only (never the one in focus).
     Returns one row per trigger with its result in R (1R = the planned loss at the stop)."""
     rows = []
@@ -486,25 +560,37 @@ def backtest_sessions(ticker, days, past_dates, pre_bars, cfg):
         end = dt.datetime.combine(d, dt.time(16, 5), NY)
         prior = days[past_dates[i - 1]] if i else []
         prev_close = prior[-1]["c"] if prior else None
-        a = analyze(days[d], prev_close, cfg, end, history=[days[x] for x in past_dates[:i]])
+        a = analyze(days[d], prev_close, cfg, end, history=[days[x] for x in past_dates[:i]], clouds=clouds)
         if a.get("status") == "TRIGGERED" and a.get("r_result") is not None:
             rows.append({"setup": "ORB", "ticker": ticker, "t": a["trigger_time"], "r": a["r_result"],
-                         "cost_r": a["cost_r"] or 0.0, "result": a["result"]})
-        for l in analyze_levels(days[d], prior, pre_bars, cfg, end):
+                         "cost_r": a["cost_r"] or 0.0, "result": a["result"],
+                         "fast_ok": a.get("fast_ok"), "trend_ok": a.get("trend_ok")})
+        for l in analyze_levels(days[d], prior, pre_bars, cfg, end, clouds):
             if l.get("status") == "TRIGGERED" and l.get("r_result") is not None:
                 c = q.cost_in_r(l["risk"], cfg.get("slippage_per_share", 0.01),
                                 cfg.get("commission_per_trade", 0.0), l["shares"] or 1) or 0.0
                 rows.append({"setup": "LEVEL " + l["side"], "ticker": ticker, "t": l["trigger_time"],
-                             "r": l["r_result"], "cost_r": c, "result": l["result"]})
+                             "r": l["r_result"], "cost_r": c, "result": l["result"],
+                             "fast_ok": l.get("fast_ok"), "trend_ok": l.get("trend_ok")})
     return rows
 
 
 def backtest_summary(scans, cfg):
     """Pools every past trigger across the watchlist and summarises it per setup (sections 10, 11, 12, 16, 17)."""
     rows = sorted((r for s in scans for r in s.get("history", [])), key=lambda r: r["t"])
-    out = []
+    fast, trend = cloud_pairs(cfg)
+    tn, fn = f"{trend[0]}/{trend[1]}", f"{fast[0]}/{fast[1]}"
+    # every trigger is replayed whatever the config says, then split by whether the clouds agreed with it,
+    # so the table shows what each cloud filter would have done to the same trades
+    groups = []
     for setup in ("ORB", "LEVEL LONG", "LEVEL SHORT"):
-        rs = [r for r in rows if r["setup"] == setup]
+        base = [r for r in rows if r["setup"] == setup]
+        groups.append((setup, base))
+        groups.append((f"{setup} + {tn}", [r for r in base if r.get("trend_ok")]))
+        groups.append((f"{setup} + {tn} + {fn}", [r for r in base if r.get("trend_ok") and r.get("fast_ok")]))
+        groups.append((f"{setup} against {tn}", [r for r in base if r.get("trend_ok") is False]))
+    out = []
+    for setup, rs in groups:
         net = [r["r"] - r["cost_r"] for r in rs]
         st = q.trade_stats(net)
         st["setup"] = setup
@@ -638,6 +724,11 @@ def _chart(a):
     lv_draw = [l for l in a.get("levels", []) if "level" in l and lo - span * 0.5 <= l["level"] <= hi + span * 0.5]
     for l in lv_draw:
         lo, hi = min(lo, l["level"]), max(hi, l["level"])
+    cb = a.get("cloud_bars") or []
+    near = [v for e_ in cb if e_ for pair in e_.values() for v in pair
+            if v is not None and lo - span * 0.5 <= v <= hi + span * 0.5]
+    if near:
+        lo, hi = min(lo, min(near)), max(hi, max(near))
     pad = (hi - lo) * 0.06 or 1
     lo, hi = lo - pad, hi + pad
     n = 78                                                       # 5-minute bars in a full session
@@ -667,6 +758,7 @@ def _chart(a):
                  f'stroke-dasharray="2 4" opacity=".9"/>'
                  f'<text x="{W-R-4}" y="{y(l["level"])-4:.1f}" fill="#6fb7ff" font-size="11" text-anchor="end">'
                  f'{l["name"]} {l["level"]:.2f}</text>')
+    s.append(_cloud_svg(a, bars, cb, xi, y, step, lo, hi, L, H))
     vw = q.vwap_series(bars)                                     # 13.5 running VWAP
     pts = [f'{xi(b["t"]) + step / 2:.1f},{y(v):.1f}' for b, v in zip(bars, vw) if v is not None and lo <= v <= hi]
     if len(pts) > 1:
@@ -692,6 +784,64 @@ def _chart(a):
                  f'<rect x="{x-w/2:.1f}" y="{top:.1f}" width="{w:.1f}" height="{max(1.0, bot-top):.1f}" fill="{col}"/>')
     s.append("</svg>")
     return "".join(s)
+
+
+CLOUD_COL = [("#2fd27a", "#ff4d3d", ".16"), ("#3fa7ff", "#ff9f1a", ".14")]   # (fast > slow, fast < slow, opacity)
+
+
+def _cloud_svg(a, bars, cb, xi, y, step, lo, hi, L, H):
+    """Ripster EMA clouds as shaded bands: the area between each pair's two EMAs, coloured by which one is on top.
+    Fast cloud green/red, trend cloud blue/orange. Values come from the last CLOSED cloud bar at each 5-minute bar."""
+    if not cb or not any(cb):
+        return ""
+    clip = lambda v: min(hi, max(lo, v))
+    out, labels = [], []
+    pairs = list(next(e for e in cb if e).keys())
+    for k, pair in enumerate(pairs):
+        up_c, dn_c, op = CLOUD_COL[min(k, len(CLOUD_COL) - 1)]
+        seg, seg_up = [], None
+
+        def flush():
+            if len(seg) > 1:
+                top = " ".join(f"{x:.1f},{y(clip(f)):.1f}" for x, f, _ in seg)
+                bot = " ".join(f"{x:.1f},{y(clip(sl)):.1f}" for x, _, sl in reversed(seg))
+                col = up_c if seg_up else dn_c
+                out.append(f'<polygon points="{top} {bot}" fill="{col}" opacity="{op}"/>'
+                           f'<polyline points="{top}" fill="none" stroke="{col}" stroke-width=".8" opacity=".55"/>')
+        for b, e_ in zip(bars, cb):
+            f, sl = (e_ or {}).get(pair, (None, None))
+            if f is None or sl is None:
+                flush()
+                seg, seg_up = [], None
+                continue
+            up = f > sl
+            x = xi(b["t"]) + step / 2
+            if seg_up is not None and up != seg_up:
+                seg.append((x, f, sl))                           # share the point so bands join where they flip
+                flush()
+                seg = []
+            seg_up = up
+            seg.append((x, f, sl))
+        flush()
+        last = cb[-1].get(pair) if cb[-1] else None
+        if last and None not in last:
+            labels.append((up_c if last[0] > last[1] else dn_c,
+                           f'EMA {pair[0]}/{pair[1]} {last[0]:.2f}/{last[1]:.2f}'))
+    for i, (col, txt) in enumerate(labels):
+        out.append(f'<text x="{L + 110 + i * 190}" y="{H - 30}" fill="{col}" font-size="11">{txt}</text>')
+    return "".join(out)
+
+
+def _cloud_txt(ema, price, cfg):
+    """One line per cloud for the QUANT panel: which EMA is on top and where the price sits."""
+    if not ema:
+        return "warming up"
+    parts = []
+    for pair in cloud_pairs(cfg):
+        pos, bull = q.cloud_state(price, *ema.get(pair, (None, None)))
+        parts.append(f"{pair[0]}/{pair[1]} " + ("warming up" if pos is None else
+                                                f'{"bull" if bull else "bear"}, price {pos}'))
+    return " · ".join(parts)
 
 
 STATUS_COL = {"TRIGGERED": "gr", "WAITING": "am", "BUILDING RANGE": "am", "NO TRIGGER": "dim",
@@ -811,7 +961,8 @@ def render(state, nav=False, auto_page=False):
             rc = "gr" if l["pnl"] > 0 else ("rd" if l["pnl"] < 0 else "am")
             tail = (f'<td class="r">{l["entry"]:.2f} at {l["trigger_time"]:%H:%M}</td><td class="r rd">{l["stop"]:.2f}</td>'
                     f'<td class="r gr">{l["target"]:.2f}</td><td class="r">{l["shares"]}</td>'
-                    f'<td class="r">{_money(l["loss_at_stop"])}</td><td class="{vc}">{l["verdict"]}</td>'
+                    f'<td class="r">{_money(l["loss_at_stop"])}</td><td class="{vc}">{l["verdict"]}'
+                    f'{" · " + e(", ".join(l["cloud_fail"])) if l.get("cloud_fail") and l["verdict"] == "BLOCK" else ""}</td>'
                     f'<td class="{rc}">{l["result"]} {l["exit_px"]:.2f} · {_money(l["pnl"])}</td>')
         else:
             tail = f'<td class="dim" colspan="7">{l["dist_pct"]:+.2f}% from last price</td>' if "dist_pct" in l \
@@ -891,10 +1042,12 @@ def render(state, nav=False, auto_page=False):
         ("Annualized vol (2.2)", _pct(qv.get("ann_vol"), 0)),
         (f'Beta / corr vs {qv.get("beta_vs", "SPY")} (5.2 / 4.2)',
          f'{_num(qv.get("beta"))} / {_num(qv.get("corr"))}' if "beta_vs" in qv else "SPY not on the watchlist"),
+        (f'EMA clouds ({cfg.get("ema_cloud_minutes", 10)}m) now', _cloud_txt(a.get("cloud_now"), a.get("last"), cfg)),
     ]
     if trig:
         qrows += [
             ("VWAP at entry", f'{_num(a.get("vwap_at_entry"))} · entry {"above" if a.get("vwap_at_entry") and a["entry"] > a["vwap_at_entry"] else "below"}'),
+            ("EMA clouds at entry", _cloud_txt(a.get("ema_at_entry"), a["entry"], cfg)),
             ("Trigger-bar volume (3.1)", f'{_num(a.get("rvol"), "{:.1f}x")} same-slot average · z {_num(a.get("vol_z"), "{:+.1f}")}'),
             ("Costs in R (17.1)", f'{_num(a.get("cost_r"), "{:.3f}R")} round trip at ${cfg.get("slippage_per_share", 0.01):.2f}/share slippage each way'),
             ("Break-even win rate (17.3)", f'{_pct(a.get("breakeven_hit"), 1)} at {a["rr"]:.0f}R after costs'),
@@ -915,12 +1068,13 @@ def render(state, nav=False, auto_page=False):
     brow = []
     for st_ in bt["setups"]:
         if not st_.get("n"):
-            brow.append(f'<tr><td>{e(st_["setup"])}</td><td class="dim" colspan="11">no triggers</td></tr>')
+            brow.append(f'<tr><td>{"&nbsp;&nbsp;" if " " in st_["setup"].replace("LEVEL ", "") else ""}{e(st_["setup"])}</td>'
+                        f'<td class="dim" colspan="11">no triggers</td></tr>')
             continue
         good = st_["avg_r"] > 0
         kel = st_.get("kelly")
         brow.append(
-            f'<tr><td>{e(st_["setup"])}</td><td class="r">{st_["n"]}</td><td class="r">{_pct(st_["hit"], 0)}</td>'
+            f'<tr><td>{"&nbsp;&nbsp;" if " " in st_["setup"].replace("LEVEL ", "") else ""}{e(st_["setup"])}</td><td class="r">{st_["n"]}</td><td class="r">{_pct(st_["hit"], 0)}</td>'
             f'<td class="r {"gr" if good else "rd"}">{st_["avg_r"]:+.2f}R</td><td class="r">{_num(st_.get("profit_factor"))}</td>'
             f'<td class="r">{_num(st_.get("sharpe"))}</td><td class="r">{_num(st_.get("sortino"))}</td>'
             f'<td class="r">{_num(st_.get("t"), "{:+.1f}")}</td><td class="r">{_pct(st_.get("psr"), 0)}</td>'
@@ -939,7 +1093,12 @@ def render(state, nav=False, auto_page=False):
         f'mean the average could be luck (3.3, 16.4). Kelly (11.1) is the fraction of the account to risk per trade that this '
         f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of 5-minute bars, so this is a '
         f'small sample from one market regime, and testing many setups on it overstates the best one (16.2). '
-        f'Only completed sessions are used; the session on screen is never in it (16.1).</div></div>')
+        f'Only completed sessions are used; the session on screen is never in it (16.1). '
+        f'Rows with "+ {"/".join(map(str, cloud_pairs(cfg)[1]))}" keep only the trades where the '
+        f'{cfg.get("ema_cloud_minutes", 10)}-minute EMA cloud agreed when the trigger bar closed (price over it for a long, '
+        f'under it for a short); "+ {"/".join(map(str, cloud_pairs(cfg)[0]))}" also needs the fast cloud pointing the '
+        f'trade\'s way; "against" is the rest. Trades from before the slow EMAs had enough bars are in none of them. '
+        f'They are the same trades as the row above, filtered, not new ones.</div></div>')
 
     head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
             f'<span>{last_txt} {chg_txt}</span>')

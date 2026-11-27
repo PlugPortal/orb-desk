@@ -5,6 +5,7 @@ with nothing to install. Section numbers refer to "The entire math behind quant 
 Every function takes plain lists of floats and returns plain floats (or None when there is not
 enough data). None of them raises on thin data.
 """
+import datetime as dt
 import math
 
 SQRT2 = math.sqrt(2.0)
@@ -175,6 +176,51 @@ def spread_pct(bid, ask):
     """13.1  (ask - bid) / mid."""
     mid = (bid + ask) / 2
     return None if mid <= 0 or bid <= 0 else (ask - bid) / mid
+
+
+# ------------------------------------------------------------ EMA clouds (Ripster)
+def ema_series(values, n):
+    """Exponential moving average, alpha = 2 / (n + 1), seeded with the simple average of the first n values
+    (the same seeding as TradingView's ta.ema). Returns a list the same length as `values`, None until n values."""
+    out = [None] * len(values)
+    if n < 1 or len(values) < n:
+        return out
+    a = 2.0 / (n + 1)
+    e = sum(values[:n]) / n
+    out[n - 1] = e
+    for i in range(n, len(values)):
+        e = a * values[i] + (1 - a) * e
+        out[i] = e
+    return out
+
+
+def resample(bars, minutes):
+    """Groups bars (dicts with t, o, h, l, c, v, oldest first) into `minutes`-long bars aligned to the clock
+    (10-minute bars start at :00, :10, ... so 9:30 starts one). Each output bar carries `end` = its close time."""
+    out = []
+    for b in bars:
+        t = b["t"]
+        start = t.replace(minute=t.minute - t.minute % minutes, second=0, microsecond=0)
+        if out and out[-1]["t"] == start:
+            o = out[-1]
+            o["h"], o["l"], o["c"] = max(o["h"], b["h"]), min(o["l"], b["l"]), b["c"]
+            o["v"] = (o.get("v") or 0) + (b.get("v") or 0)
+        else:
+            out.append({"t": start, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b.get("v") or 0})
+    for o in out:
+        o["end"] = o["t"] + dt.timedelta(minutes=minutes)
+    return out
+
+
+def cloud_state(price, fast, slow):
+    """Where a price sits against one EMA cloud. Returns (position, bullish):
+    position is "above" (over both lines), "below" (under both) or "inside"; bullish = fast EMA over slow EMA.
+    (None, None) while either EMA is still warming up."""
+    if price is None or fast is None or slow is None:
+        return None, None
+    top, bot = max(fast, slow), min(fast, slow)
+    pos = "above" if price > top else "below" if price < bot else "inside"
+    return pos, fast > slow
 
 
 # ------------------------------------------------------------ 17. costs

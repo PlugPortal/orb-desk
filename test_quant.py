@@ -51,6 +51,29 @@ def main():
     close(s["hit"], 0.4, 1e-12)
     close(s["avg_r"], 0.2, 1e-12)
     close(s["profit_factor"], 4 / 3, 1e-12)
+    # EMA: seeded with the simple average of the first n, then alpha = 2 / (n + 1)
+    e = q.ema_series([1, 2, 3, 4, 5], 3)
+    assert e[:2] == [None, None]
+    close(e[2], 2.0, 1e-12)
+    close(e[3], 3.0, 1e-12)                      # 0.5 * 4 + 0.5 * 2
+    close(e[4], 4.0, 1e-12)
+    assert q.ema_series([1, 2], 3) == [None, None]
+    # a constant series has every EMA equal to it
+    assert all(abs(x - 7) < 1e-12 for x in q.ema_series([7.0] * 60, 50)[49:])
+    # resample 5-minute bars into clock-aligned 10-minute bars
+    import datetime as dt
+    t0 = dt.datetime(2026, 11, 20, 9, 30)
+    five = [{"t": t0 + dt.timedelta(minutes=5 * i), "o": 10 + i, "h": 11 + i, "l": 9 + i, "c": 10.5 + i, "v": 100}
+            for i in range(4)]
+    ten = q.resample(five, 10)
+    assert [b["t"].minute for b in ten] == [30, 40]
+    assert (ten[0]["o"], ten[0]["h"], ten[0]["l"], ten[0]["c"], ten[0]["v"]) == (10, 12, 9, 11.5, 200)
+    assert ten[1]["end"] == dt.datetime(2026, 11, 20, 9, 50)
+    # cloud position and direction
+    assert q.cloud_state(105, 101, 100) == ("above", True)
+    assert q.cloud_state(100.5, 100, 101) == ("inside", False)
+    assert q.cloud_state(99, 100, 101) == ("below", False)
+    assert q.cloud_state(99, None, 101) == (None, None)
     print("all quant checks passed")
 
 
