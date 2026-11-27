@@ -9,14 +9,16 @@ Both use `desk.py` for the rule and `config.json` for your settings. Data is Yah
 The page shows a plan. It never places an order.
 
 ## The rule
-1. Opening range = high and low of the first 15 minutes (9:30-9:45 New York).
-2. Entry = the first completed 5-minute bar that closes above the range high, before 11:30.
+0. Candles are 10 minutes (`bar_minutes`), the timeframe Ripster trades on. Yahoo has no 10-minute interval, so its
+   5-minute bars are merged two at a time (9:30-9:40, 9:40-9:50, ...). Set `bar_minutes` to 5 for the old behaviour.
+1. Opening range = high and low of the first 10 minutes (`range_minutes`, 9:30-9:40 New York).
+2. Entry = the first completed 10-minute bar that closes above the range high, before 11:30.
 3. Stop = range midpoint. Target = entry + 2 x (entry - stop). Flat by 15:55.
 4. Shares = the smaller of (max loss / risk per share) and (budget / entry price).
 
 ## Second setup: level retests
 Levels: PDH/PDL (prior day high/low) and PMH/PML (premarket high/low, 4:00-9:30 New York).
-Long above PDH/PMH, short below PDL/PML. A 5-minute close must break the level, then a later bar must
+Long above PDH/PMH, short below PDL/PML. A 10-minute close must break the level, then a later bar must
 touch it again and close back on the breakout side; that close is the entry (before 11:30).
 Stop = 1% of entry, target = 2R. Shorts are shown as WATCH ONLY unless `trade_shorts` is true.
 
@@ -36,7 +38,7 @@ trend cloud, drawn on the 10-minute chart with premarket and after hours on. Its
   `ema_cloud_extended_hours` (true), `require_ema_cloud` (false), `require_fast_cloud` (false).
 
 ## BUY / SELL arrows (confluence)
-Every closed 5-minute bar is scored out of 5 for a long and for a short: close vs VWAP, close vs the 10m 34/50 cloud,
+Every closed 10-minute bar is scored out of 5 for a long and for a short: close vs VWAP, close vs the 10m 34/50 cloud,
 the 5/12 cloud's direction, close beyond the opening range, and relative volume at or over `confluence_rvol` (1.5x).
 The strip over the chart shows the latest score (`CONFLUENCE L 4/5 | S 1/5`) and which checks are green.
 An arrow needs a setup first (ORB or a level retest; SELL only from PDL / PML retests). From its trigger to the entry

@@ -25,7 +25,27 @@ e_ = html.escape
 
 NY = ZoneInfo("America/New_York")
 UA = {"User-Agent": "Mozilla/5.0 (orb-desk)"}
-BAR = dt.timedelta(minutes=5)
+BAR = dt.timedelta(minutes=5)                                     # Yahoo's bar; resampled to cfg["bar_minutes"]
+
+
+def bar_minutes(cfg):
+    return int(cfg.get("bar_minutes", 5))
+
+
+def set_bar(cfg):
+    """The desk runs on `bar_minutes` candles (10 by default, the timeframe Ripster trades on). Yahoo has no
+    10-minute interval, so 5-minute bars are fetched and merged two at a time, aligned to the clock (9:30, 9:40, ...)."""
+    global BAR
+    BAR = dt.timedelta(minutes=bar_minutes(cfg))
+
+
+def to_bar_size(meta, bars, cfg):
+    """Resamples the regular, premarket and after-hours bars to `bar_minutes`. No-op at 5."""
+    m = bar_minutes(cfg)
+    if m == 5:
+        return meta, bars
+    meta = dict(meta, pre_bars=q.resample(meta.get("pre_bars", []), m), post_bars=q.resample(meta.get("post_bars", []), m))
+    return meta, q.resample(bars, m)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -218,7 +238,7 @@ def analyze(day_bars, prev_close, cfg, now, history=None, clouds=None):
     cutoff = dt.datetime.combine(day, _hhmm(cfg["entry_cutoff"]), NY)
     flat_t = dt.datetime.combine(day, _hhmm(cfg["flat_by"]), NY)
     rng = [b for b in done if b["t"] < range_end]
-    need = cfg["range_minutes"] // 5
+    need = max(1, cfg["range_minutes"] // bar_minutes(cfg))
     if len(rng) < need:
         out["status"] = "BUILDING RANGE"
         return out
@@ -631,6 +651,8 @@ def analyze_ticker(ticker, cfg, now, session_date=None):
 
 
 def analyze_from_bars(ticker, meta, bars, cfg, now, session_date=None):
+    set_bar(cfg)
+    meta, bars = to_bar_size(meta, bars, cfg)
     days = split_sessions(bars)
     dates = sorted(d for d in days if d <= now.date())
     if session_date:
@@ -725,7 +747,7 @@ def focus_quant(focus, scans, cfg, now):
     closes_by_day = [[b["c"] for b in bs] for _, bs in sorted(days.items())]
     rets = [r for cl in closes_by_day for r in q.log_returns(cl)]   # within-session 5m returns, no overnight gaps
     sig = q.stdev(rets)
-    out = {"sigma5": sig, "ewma5": q.ewma_vol(rets), "ann_vol": q.annualize_vol(sig, q.BARS_PER_DAY * q.DAYS_PER_YEAR),
+    out = {"sigma5": sig, "ewma5": q.ewma_vol(rets), "ann_vol": q.annualize_vol(sig, 390 // bar_minutes(cfg) * q.DAYS_PER_YEAR),
            "n_rets": len(rets), "vwap": focus.get("vwap")}
     if focus.get("vwap") and focus.get("last"):
         out["vs_vwap_pct"] = (focus["last"] / focus["vwap"] - 1) * 100
@@ -759,6 +781,7 @@ def focus_quant(focus, scans, cfg, now):
 def build_state(cfg, now=None, session_date=None):
     """Everything the page needs. `now` and `session_date` let you replay a past session."""
     now = now or dt.datetime.now(NY)
+    set_bar(cfg)
     watch = list(dict.fromkeys(cfg["watchlist"]))
     with ThreadPoolExecutor(max_workers=5) as ex:
         scans = list(ex.map(lambda t: analyze_ticker(t, cfg, now, session_date), watch))
@@ -846,13 +869,13 @@ def _chart(a):
         lo, hi = min(lo, min(near)), max(hi, max(near))
     pad = (hi - lo) * 0.06 or 1
     lo, hi = lo - pad, hi + pad
-    n = 78                                                       # 5-minute bars in a full session
+    n = 390 // int(BAR.total_seconds() // 60)                    # bars in a full 9:30-16:00 session
     step = (W - L - R) / n
     y = lambda p: T + (hi - p) / (hi - lo) * (H - T - B)
     day = bars[0]["t"].date()
     open_t = dt.datetime.combine(day, dt.time(9, 30), NY)
     xi = lambda t: L + ((t - open_t) / BAR) * step
-    s = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="5-minute chart">']
+    s = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{int(BAR.total_seconds() // 60)}-minute chart">']
     for i in range(5):                                           # price grid
         p = lo + (hi - lo) * i / 4
         s.append(f'<line x1="{L}" x2="{W-R}" y1="{y(p):.1f}" y2="{y(p):.1f}" stroke="#221b0d"/>'
@@ -1064,7 +1087,7 @@ def render(state, nav=False, auto_page=False):
         steps = [
             ("Scan", "PASS", "gr", f'closed over its {cfg["range_minutes"]}m range'),
             ("News", "LIVE", "gr", f'{len(state["news"])} headlines'),
-            ("Entry", "TRIGGERED", "gr", f'first 5m close over range, {a["entry"]:.2f} at {a["trigger_time"]:%H:%M}'),
+            ("Entry", "TRIGGERED", "gr", f'first {bar_minutes(cfg)}m close over range, {a["entry"]:.2f} at {a["trigger_time"]:%H:%M}'),
             ("Exit", "PLAN", "gr", f'stop {a["stop"]:.2f} · target {a["target"]:.2f} · flat {cfg["flat_by"]}'),
             ("Size", "SIZED" if a["shares"] else "TOO BIG", "gr" if a["shares"] else "rd",
              f'{_money(a["max_loss"])} max loss / {_money(a["risk"])} risk · limit: {a["decided_by"]} = {a["shares"]} sh'),
@@ -1075,8 +1098,8 @@ def render(state, nav=False, auto_page=False):
              else f'the setup itself ended {a["result"].lower()} at {a["exit_px"]:.2f}'),
         ]
     else:
-        why = {"WAITING": f'no 5m close over {a.get("range_high", 0):.2f} yet',
-               "NO TRIGGER": f'no 5m close over {a.get("range_high", 0):.2f} before {cfg["entry_cutoff"]}',
+        why = {"WAITING": f'no {bar_minutes(cfg)}m close over {a.get("range_high", 0):.2f} yet',
+               "NO TRIGGER": f'no {bar_minutes(cfg)}m close over {a.get("range_high", 0):.2f} before {cfg["entry_cutoff"]}',
                "BUILDING RANGE": "opening range still forming", "NOT OPEN": "market not open",
                "NO DATA": "no data returned"}.get(a.get("status"), "")
         steps = [("Scan", a.get("status", "-"), STATUS_COL.get(a.get("status"), ""), why),
@@ -1195,7 +1218,7 @@ def render(state, nav=False, auto_page=False):
     qv = state.get("quant") or {}
     qrows = [
         ("VWAP (13.5)", f'{_num(qv.get("vwap"))} · last {_num(qv.get("vs_vwap_pct"), "{:+.2f}%")} vs VWAP'),
-        ("5m volatility (2.1 / 2.3)", f'{_pct(qv.get("sigma5"), 2)} per bar · EWMA {_pct(qv.get("ewma5"), 2)} · '
+        (f"{bar_minutes(cfg)}m volatility (2.1 / 2.3)", f'{_pct(qv.get("sigma5"), 2)} per bar · EWMA {_pct(qv.get("ewma5"), 2)} · '
                                       f'{qv.get("n_rets", 0)} returns'),
         ("Annualized vol (2.2)", _pct(qv.get("ann_vol"), 0)),
         (f'Beta / corr vs {qv.get("beta_vs", "SPY")} (5.2 / 4.2)',
@@ -1249,7 +1272,7 @@ def render(state, nav=False, auto_page=False):
         f'<div class="b dim">Per trade, in R (1R = the planned loss at the stop; {_money(cfg["budget"] * cfg["max_loss_pct"] / 100)} '
         f'here). Sharpe and Sortino are per trade, not annualized (10.1, 10.2). T-STAT under about 2 and PSR under about 95% '
         f'mean the average could be luck (3.3, 16.4). Kelly (11.1) is the fraction of the account to risk per trade that this '
-        f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of 5-minute bars, so this is a '
+        f'sample implies; your setting is {cfg["max_loss_pct"]}%. Yahoo keeps only about 5 days of intraday bars, so this is a '
         f'small sample from one market regime, and testing many setups on it overstates the best one (16.2). '
         f'Only completed sessions are used; the session on screen is never in it (16.1). '
         f'Rows with "+ {"/".join(map(str, cloud_pairs(cfg)[1]))}" keep only the trades where the '
@@ -1260,7 +1283,7 @@ def render(state, nav=False, auto_page=False):
         f'close, the setup\'s own stop, target {cfg["target_r_multiple"]}R from there; SELL arrows count even when shorts are '
         f'watch only.</div></div>')
 
-    head = (f'{e(a.get("ticker", "-"))} 5-MIN · OPENING RANGE BREAKOUT'
+    head = (f'{e(a.get("ticker", "-"))} {bar_minutes(cfg)}-MIN · OPENING RANGE BREAKOUT'
             f'<span>{last_txt} {chg_txt}</span>')
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>ORB Desk · {e(a.get("ticker", ""))}</title>
@@ -1295,7 +1318,7 @@ def render(state, nav=False, auto_page=False):
  <div class="p"><h2>RISK</h2><table>{risk}</table>{verdict}
   <div class="b dim" style="text-align:center">nothing sends from this page</div></div>
 </div>
-<div class="bar foot"><span><span class="am">DATA</span> Yahoo Finance 5-minute bars and headlines, delayed ·
+<div class="bar foot"><span><span class="am">DATA</span> Yahoo Finance 5-minute bars as {bar_minutes(cfg)}-minute candles, and headlines, delayed ·
  budget {_money(cfg["budget"])} · max loss {cfg["max_loss_pct"]}% · target {cfg["target_r_multiple"]}R ·
  entries until {cfg["entry_cutoff"]} · flat by {cfg["flat_by"]} ET</span>
  <span class="dim">Long side only. A display of a rule, not advice.</span></div>
