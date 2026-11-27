@@ -20,6 +20,21 @@ Long above PDH/PMH, short below PDL/PML. A 5-minute close must break the level, 
 touch it again and close back on the breakout side; that close is the entry (before 11:30).
 Stop = 1% of entry, target = 2R. Shorts are shown as WATCH ONLY unless `trade_shorts` is true.
 
+## EMA clouds (Ripster)
+From ripstereducation.com/ripster-clouds/ema-clouds: the 5/12 cloud is the day-trade trendline, the 34/50 is the
+trend cloud, drawn on the 10-minute chart with premarket and after hours on. Its rule: never long under the 10-minute
+34/50, never short over it.
+- **Chart**: both clouds as shaded bands under the candles (5/12 green when the 5 EMA is on top, red when not;
+  34/50 blue / orange). VWAP stays as it was. Values come from the last closed 10-minute bar, so nothing looks ahead.
+- **Risk check (off by default)**: `require_ema_cloud` adds "price over the 10m 34/50 cloud" (under it for a short
+  level trade); `require_fast_cloud` adds "5/12 cloud points the trade's way and price is not on the wrong side of it".
+- **BACKTEST**: every setup also has rows for the trades where the 34/50 agreed, where both clouds agreed, and where
+  the 34/50 was against the trade. These are the same trades filtered, so you can see what each filter would have done
+  before you switch it on. With about 5 days of Yahoo data the slow EMAs need a day or so to warm up, so the sample is
+  small: read the t-stat and PSR.
+- Settings: `ema_cloud_minutes` (10), `ema_fast_cloud` ([5, 12]), `ema_trend_cloud` ([34, 50]),
+  `ema_cloud_extended_hours` (true), `require_ema_cloud` (false), `require_fast_cloud` (false).
+
 ## Option ideas (optional, needs Alpaca paper keys)
 For the ticker in focus: calls and puts 2-5 strikes out of the money, expiring within 5 sessions (0DTE included).
 Stop = 15% of the premium; targets at 1:1, 1:2, 1:3. A row is blocked if one contract costs more than the budget,

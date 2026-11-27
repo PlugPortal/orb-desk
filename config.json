@@ -22,6 +22,18 @@
   "risk_free_rate": 0.04,
   "require_above_vwap": false,
   "min_rvol": 0,
+  "ema_cloud_minutes": 10,
+  "ema_fast_cloud": [
+    5,
+    12
+  ],
+  "ema_trend_cloud": [
+    34,
+    50
+  ],
+  "ema_cloud_extended_hours": true,
+  "require_ema_cloud": false,
+  "require_fast_cloud": false,
   "beta_vs": "SPY",
   "watchlist": [
     "PFE",
