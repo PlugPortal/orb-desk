@@ -17,6 +17,12 @@
   "option_otm_max": 5,
   "option_stop_pct": 15,
   "option_expiries_shown": 2,
+  "slippage_per_share": 0.01,
+  "commission_per_trade": 0,
+  "risk_free_rate": 0.04,
+  "require_above_vwap": false,
+  "min_rvol": 0,
+  "beta_vs": "SPY",
   "watchlist": [
     "PFE",
     "D",
