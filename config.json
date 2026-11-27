@@ -35,7 +35,7 @@
   "ema_cloud_extended_hours": true,
   "require_ema_cloud": false,
   "require_fast_cloud": false,
-  "confluence_min": 4,
+  "confluence_min": 5,
   "confluence_rvol": 1.5,
   "beta_vs": "SPY",
   "watchlist": [

@@ -42,7 +42,7 @@ Every closed 10-minute bar is scored out of 5 for a long and for a short: close 
 the 5/12 cloud's direction, close beyond the opening range, and relative volume at or over `confluence_rvol` (1.5x).
 The strip over the chart shows the latest score (`CONFLUENCE L 4/5 | S 1/5`) and which checks are green.
 An arrow needs a setup first (ORB or a level retest; SELL only from PDL / PML retests). From its trigger to the entry
-cutoff, the arrow goes on the first bar whose score reaches `confluence_min` (4) while the setup's stop is untouched.
+cutoff, the arrow goes on the first bar whose score reaches `confluence_min` (5, every check agrees) while the setup's stop is untouched.
 One BUY and one SELL per session at most. SELL arrows are marked watch only unless `trade_shorts` is true. The BACKTEST
 has BUY ARROW and SELL ARROW rows: entry at the arrow's close, the setup's stop, target `target_r_multiple` from there.
 
